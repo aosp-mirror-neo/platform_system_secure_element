@@ -47,8 +47,7 @@ use serde::{Deserialize, Deserializer};
 use serde_xml_rs::from_reader;
 use thiserror::Error;
 
-const SHA1_OR_UUID_LEN: usize = 20;
-const SHA256_LEN: usize = 32;
+use super::rules::{SHA1_OR_UUID_LEN, SHA256_LEN};
 
 #[derive(Error, Debug)]
 pub enum AraXmlError {

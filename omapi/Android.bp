@@ -18,6 +18,7 @@ rust_defaults {
     srcs: ["src/lib.rs"],
     rustlibs: [
         "libandroid_logger",
+        "libanyhow",
         "libhex",
         "libitertools",
         "liblog_rust",
@@ -42,4 +43,15 @@ rust_test {
     rustlibs: [
         "libgoogletest_rust",
     ],
+}
+
+rust_test {
+    name: "libse_service_test_disallow_unknown_tags",
+    defaults: ["libse_service_defaults"],
+    test_suites: ["general-tests"],
+    auto_gen_config: true,
+    rustlibs: [
+        "libgoogletest_rust",
+    ],
+    features: ["disallow_unknown_ara_tags"],
 }
