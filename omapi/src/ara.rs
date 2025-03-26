@@ -16,5 +16,7 @@
 //! Control](https://globalplatform.org/wp-content/uploads/2024/08/GPD_SE_Access_Control_v1.1.0.10_PublicRvw.pdf)
 //! Access Control Enforcer (ACE).
 
-#[allow(dead_code)] // TODO: remove when client code is added.
+#[allow(dead_code)] // TODO: Remove when client code is added.
 mod tlv;
+#[allow(dead_code)] // TODO: Remove when client code is added.
+mod xml;
