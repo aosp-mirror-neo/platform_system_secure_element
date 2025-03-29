@@ -17,11 +17,14 @@ rust_defaults {
     crate_name: "se_service",
     srcs: ["src/lib.rs"],
     rustlibs: [
+        "libandroid_logger",
         "libhex",
-        "liblog_rust",
-        "libthiserror",
-        "libstrum",
         "libitertools",
+        "liblog_rust",
+        "libserde_xml_rs",
+        "libserde",
+        "libstrum",
+        "libthiserror",
     ],
     proc_macros: ["libstrum_macros"],
 }
