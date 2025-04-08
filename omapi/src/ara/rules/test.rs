@@ -1583,7 +1583,40 @@ fn text_xml_rules() -> Result<()> {
       </ref_ar_do>
     </rules>"#;
 
-    let _rules = RuleCache::xml_to_rules(xml::parse_xml_rules(text.as_bytes())?)?;
+    let xml_rules = xml::parse_xml_rules(text.as_bytes())?
+        .ref_ar_do
+        .into_iter()
+        .map(Rule::from_xml)
+        .collect::<Result<Vec<_>>>()?;
+
+    // Create the same rules with [`tlv::Object`]s, so we can verify the constructed [`Rule`]
+    // objects are the same.
+    let aid1 = AppletId::new(&[0xA0, 0x00, 0x00, 0x01, 0x51, 0x41, 0x43, 0x4C, 0x00]);
+    let aid2 = AppletId::new(&[0xA0, 0x00, 0x00, 0x0B, 0xCD, 0xEF]);
+    let app = DeviceAppId::Apk {
+        sha1s: vec![],
+        sha256s: vec![Sha256Digest([
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+            0xEE, 0xFF, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB,
+            0xCC, 0xDD, 0xEE, 0xFF,
+        ])],
+        package_names: vec![],
+    };
+
+    let tlv = vec![
+        rule(
+            matcher(match_aid(&aid1), match_app_sha256(&app)),
+            access_rule(apdu_access_always(), no_rule()),
+        ),
+        rule(
+            matcher(match_aid(&aid2), match_any_app()),
+            access_rule(apdu_access_never(), no_rule()),
+        ),
+    ];
+
+    let tlv_rules = tlv.into_iter().map(Rule::from_tlv).collect::<Result<Vec<_>>>()?;
+
+    assert_that!(xml_rules, eq(&tlv_rules));
 
     Ok(())
 }

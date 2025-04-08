@@ -15,7 +15,10 @@
 //! Utility functions and types, notably tools for creating binder exceptions and easy tracing of
 //! return values.
 
-use crate::terminal::{Apdu, ApduResponse};
+use crate::{
+    access_enforcer::RefreshTagDo,
+    terminal::{Apdu, ApduResponse},
+};
 use binder::{self, ExceptionCode, Result};
 use std::error::Error;
 
@@ -26,7 +29,7 @@ pub enum ServiceSpecificException {
     /// No such Secure Element is configured.
     NoSuchElement = 2,
     /// Secure Element is not present (e.g. SIM is not inserted).
-    _SecureElementNotPresent = 3,
+    SecureElementNotPresent = 3,
     /// Secure Element is not connected.
     SecureElementNotConnected = 4,
 }
@@ -70,6 +73,18 @@ impl Traceable for Vec<u8> {
     }
 }
 
+impl<T> Traceable for Option<T>
+where
+    T: Traceable,
+{
+    fn trace_string(&self) -> String {
+        match self {
+            Some(value) => format!("Some({})", value.trace_string()),
+            None => "None".to_string(),
+        }
+    }
+}
+
 macro_rules! trace_debug {
     ($t:ty) => {
         impl Traceable for $t {
@@ -82,6 +97,7 @@ macro_rules! trace_debug {
 
 trace_debug!(Apdu);
 trace_debug!(ApduResponse);
+trace_debug!(RefreshTagDo);
 
 /// Provide an easy way to trace [`Traceable`] values that are about to be returned.  That is,
 /// supposing `result` is [`Traceable`] and is being returned from a function:

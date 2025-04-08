@@ -16,9 +16,13 @@
 //! Control](https://globalplatform.org/wp-content/uploads/2024/08/GPD_SE_Access_Control_v1.1.0.10_PublicRvw.pdf)
 //! Access Control Enforcer (ACE).
 
+pub mod tlv;
+
 #[allow(dead_code)] // TODO: Remove when client code is added.
 mod rules;
 #[allow(dead_code)] // TODO: Remove when client code is added.
-mod tlv;
-#[expect(dead_code)] // TODO: Remove when client code is added.
 mod xml;
+
+pub use rules::{
+    ApduAccessRule, AppletId, DeviceAppId, Rule, RuleCache, Sha1DigestOrUuid, Sha256Digest,
+};
