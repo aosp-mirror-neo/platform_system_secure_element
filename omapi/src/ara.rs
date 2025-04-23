@@ -17,6 +17,8 @@
 //! Access Control Enforcer (ACE).
 
 #[allow(dead_code)] // TODO: Remove when client code is added.
+mod rules;
+#[allow(dead_code)] // TODO: Remove when client code is added.
 mod tlv;
 #[allow(dead_code)] // TODO: Remove when client code is added.
 mod xml;
