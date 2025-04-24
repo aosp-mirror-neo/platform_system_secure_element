@@ -26,6 +26,8 @@ mod se_service;
 mod system_services;
 mod terminal;
 mod utils;
+#[allow(dead_code)] // TODO: Remove when client code is added.
+mod uuid_mapping;
 
 pub use se_service::SecureElementService;
 
