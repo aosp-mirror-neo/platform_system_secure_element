@@ -183,7 +183,7 @@ mod test {
     fn init() {
         android_logger::init_once(
             android_logger::Config::default()
-                .with_tag("se_service_test")
+                .with_tag("se_service_xml_rules_test")
                 .with_max_level(log::LevelFilter::Trace)
                 .with_log_buffer(android_logger::LogId::System)
                 .format(|buf, record| {
