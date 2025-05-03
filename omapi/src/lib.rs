@@ -18,12 +18,12 @@
 
 mod access_enforcer;
 mod aidl_channel;
-#[allow(dead_code)] // TODO: Remove when client code is added.
 mod aidl_reader;
 mod aidl_session;
 mod ara;
-#[expect(dead_code)] // TODO: Remove when client code is added.
 mod reader;
+#[expect(dead_code)] // TODO: Remove when client code is added.
+mod se_service;
 #[expect(dead_code)] // TODO: Remove when client code is added.
 mod system_services;
 mod terminal;

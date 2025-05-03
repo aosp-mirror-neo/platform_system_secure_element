@@ -112,6 +112,8 @@ trace_debug!(Apdu);
 trace_debug!(ApduResponse);
 trace_debug!(RefreshTagDo);
 trace_debug!(bool);
+trace_debug!(Vec<bool>);
+trace_debug!(Vec<String>);
 
 /// Provide an easy way to trace [`Traceable`] values that are about to be returned.  That is,
 /// supposing `result` is [`Traceable`] and is being returned from a function:
