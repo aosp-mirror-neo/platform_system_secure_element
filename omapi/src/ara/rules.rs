@@ -342,7 +342,7 @@ impl Rule {
 
     /// Create a [`Rule`] from an [`xml::RefArDo`].  Returns [`Err`] if the object does not
     /// contain a valid REF-AR-DO structure.
-    fn from_xml(ref_ar_do: xml::RefArDo) -> Result<Rule> {
+    pub fn from_xml(ref_ar_do: xml::RefArDo) -> Result<Rule> {
         let criteria = MatchCriteria::from_xml(ref_ar_do.get_match_criteria())?;
         let access = AccessRules::from_xml(ref_ar_do.get_apdu_access())?;
         Ok(Rule { criteria, access })

@@ -20,15 +20,16 @@ mod access_enforcer;
 mod aidl_channel;
 mod aidl_reader;
 mod aidl_session;
+mod android_system_services;
 mod ara;
 mod reader;
 mod se_service;
 mod system_services;
 mod terminal;
 mod utils;
-#[allow(dead_code)] // TODO: Remove when client code is added.
 mod uuid_mapping;
 
+pub use android_system_services::{is_debuggable_build, AndroidSystemServices};
 pub use se_service::SecureElementService;
 
 #[cfg(test)]

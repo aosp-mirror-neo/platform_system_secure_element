@@ -27,3 +27,4 @@ pub use rules::{
     ApduAccessRule, ApduHeader, AppletId, DeviceAppId, Rule, RuleCache, Sha1DigestOrUuid,
     Sha256Digest,
 };
+pub use xml::parse_xml_rules;

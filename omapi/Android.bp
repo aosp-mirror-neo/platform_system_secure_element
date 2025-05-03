@@ -27,11 +27,13 @@ rust_defaults {
         "libitertools",
         "liblog_rust",
         "libmockall",
+        "librustutils",
         "libserde_xml_rs",
         "libserde",
         "libstrum",
         "libthiserror",
         "libzeroize",
+        "packagemanager_aidl-rust",
     ],
     proc_macros: ["libstrum_macros"],
     // The "log_sensitive_data" feature enables detailed debug tracing.  This is useful but
