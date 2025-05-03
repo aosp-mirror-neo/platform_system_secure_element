@@ -13,8 +13,8 @@
 // limitations under the License.
 
 rust_defaults {
-    name: "libse_service_defaults",
-    crate_name: "se_service",
+    name: "libomapi_defaults",
+    crate_name: "omapi",
     srcs: ["src/lib.rs"],
     rustlibs: [
         "android.hardware.secure_element-V1-rust",
@@ -38,17 +38,17 @@ rust_defaults {
     proc_macros: ["libstrum_macros"],
     // The "log_sensitive_data" feature enables detailed debug tracing.  This is useful but
     // verbose and may log sensitive data, so enable it only for developer builds.
-    //features: ["log_sensitive_data"],
+    // features: ["log_sensitive_data"],
 }
 
 rust_library {
-    name: "libse_service",
-    defaults: ["libse_service_defaults"],
+    name: "libomapi",
+    defaults: ["libomapi_defaults"],
 }
 
 rust_test {
-    name: "libse_service_test",
-    defaults: ["libse_service_defaults"],
+    name: "libomapi_test",
+    defaults: ["libomapi_defaults"],
     test_suites: ["general-tests"],
     auto_gen_config: true,
     rustlibs: [
@@ -59,12 +59,32 @@ rust_test {
 }
 
 rust_test {
-    name: "libse_service_test_disallow_unknown_tags",
-    defaults: ["libse_service_defaults"],
+    name: "libomapi_test_disallow_unknown_tags",
+    defaults: ["libomapi_defaults"],
     test_suites: ["general-tests"],
     auto_gen_config: true,
     rustlibs: [
         "libgoogletest_rust",
     ],
     features: ["disallow_unknown_ara_tags"],
+}
+
+rust_binary {
+    name: "omapi",
+    init_rc: ["omapi.rc"],
+    vintf_fragment_modules: [
+        "omapi.xml",
+    ],
+    srcs: ["src/omapi_main.rs"],
+    rustlibs: [
+        "libandroid_logger",
+        "libbinder_rs",
+        "liblog_rust",
+        "libomapi",
+    ],
+}
+
+vintf_fragment {
+    name: "omapi.xml",
+    src: "omapi.xml",
 }

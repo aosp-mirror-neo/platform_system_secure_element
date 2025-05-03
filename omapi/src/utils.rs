@@ -34,6 +34,39 @@ pub enum ServiceSpecificException {
     SecureElementNotConnected = 4,
 }
 
+/// Set up logging.  By default, we log "info" and higher on user builds, and "debug" or higher on
+/// userdebug and eng builds.
+///
+/// Sensitive data may only be logged with [`se_service::sensitive`], which logs at the "trace"
+/// level.  It is disabled unless the service is built with feature "log_sensitive_data" enabled,
+/// which may only be enabled in local developer builds for test devices.  Enabling that feature
+/// also enables "trace" logging, which is rather verbose.
+pub fn initialize_logging(tag: &str, debuggable_build: bool) {
+    let log_level = if cfg!(any(feature = "log_sensitive_data", test)) {
+        log::LevelFilter::Trace
+    } else if debuggable_build {
+        log::LevelFilter::Debug
+    } else {
+        log::LevelFilter::Info
+    };
+
+    android_logger::init_once(
+        android_logger::Config::default()
+            .with_tag(tag)
+            .with_max_level(log_level)
+            .with_log_buffer(android_logger::LogId::System)
+            .format(|buf, record| {
+                writeln!(
+                    buf,
+                    "{}:{} - {}",
+                    record.file().unwrap_or("unknown"),
+                    record.line().unwrap_or(0),
+                    record.args()
+                )
+            }),
+    );
+}
+
 /// Create a [`binder::Result`] containing a service-specific exception.
 pub fn service_specific_exception<T>(error: ServiceSpecificException, message: &str) -> Result<T> {
     Err(binder::Status::new_service_specific_error_str(error as i32, Some(message)))
