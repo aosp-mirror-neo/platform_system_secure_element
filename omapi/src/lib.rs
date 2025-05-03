@@ -16,4 +16,7 @@
 
 #![deny(missing_docs)]
 
-pub mod ara;
+mod ara;
+#[allow(dead_code)] // TODO: Remove when client code is added.
+mod terminal;
+mod utils;
