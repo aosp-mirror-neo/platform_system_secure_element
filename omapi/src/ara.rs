@@ -24,5 +24,6 @@ mod rules;
 mod xml;
 
 pub use rules::{
-    ApduAccessRule, AppletId, DeviceAppId, Rule, RuleCache, Sha1DigestOrUuid, Sha256Digest,
+    ApduAccessRule, ApduHeader, AppletId, DeviceAppId, Rule, RuleCache, Sha1DigestOrUuid,
+    Sha256Digest,
 };

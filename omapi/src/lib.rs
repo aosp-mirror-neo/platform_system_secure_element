@@ -17,6 +17,10 @@
 #![deny(missing_docs)]
 
 mod access_enforcer;
+mod aidl_channel;
+#[allow(dead_code)] // TODO: Remove when client code is added.
+mod aidl_reader;
+mod aidl_session;
 mod ara;
 #[expect(dead_code)] // TODO: Remove when client code is added.
 mod reader;
@@ -25,5 +29,7 @@ mod system_services;
 mod terminal;
 mod utils;
 
+#[cfg(test)]
+mod test;
 #[cfg(test)]
 mod test_utils;
