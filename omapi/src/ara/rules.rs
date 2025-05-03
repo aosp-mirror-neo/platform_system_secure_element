@@ -47,9 +47,14 @@ pub const APDU_HEADER_LEN: usize = 4;
 /// the mask result.
 pub const APDU_FILTER_SET_LEN: usize = 2 * APDU_HEADER_LEN;
 
+/// SHA-256 digest of an application certificate
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Sha256Digest(pub [u8; SHA256_LEN]);
 
+/// Either a SHA-1 digest of an application certificate or a 20-byte UUID.  These are different
+/// things, but because ARA rules don't distinguish between them it's impossible to know which one
+/// is meant when a 20-byte identifier is found in a rule.  So this type contains some sort of
+/// 20-byte value and we match it against both SHA-1 digests and UUIDs.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Sha1DigestOrUuid(pub [u8; SHA1_OR_UUID_LEN]);
 
