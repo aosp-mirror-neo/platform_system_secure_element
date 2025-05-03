@@ -17,32 +17,9 @@ use log::trace;
 
 use super::tlv::{Object, Tag, Value};
 use super::*;
+use crate::test_utils::init;
 use googletest::prelude::*;
 use googletest::test as gtest;
-
-#[cfg(not(feature = "notandroid"))]
-fn init() {
-    android_logger::init_once(
-        android_logger::Config::default()
-            .with_tag("se_service_rules_test")
-            .with_max_level(log::LevelFilter::Trace)
-            .with_log_buffer(android_logger::LogId::System)
-            .format(|buf, record| {
-                writeln!(
-                    buf,
-                    "{}:{} - {}",
-                    record.file().unwrap_or("unknown"),
-                    record.line().unwrap_or(0),
-                    record.args()
-                )
-            }),
-    );
-}
-
-#[cfg(feature = "notandroid")]
-fn init() {
-    let _ = env_logger::builder().is_test(true).try_init();
-}
 
 #[gtest]
 fn test_apdu_access_rule_merging() -> Result<()> {
