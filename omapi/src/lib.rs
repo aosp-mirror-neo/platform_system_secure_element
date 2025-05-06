@@ -17,6 +17,6 @@
 #![deny(missing_docs)]
 
 mod ara;
-#[allow(dead_code)] // TODO: Remove when client code is added.
+#[expect(dead_code)] // TODO: Remove when client code is added.
 mod terminal;
 mod utils;

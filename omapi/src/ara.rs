@@ -20,5 +20,5 @@
 mod rules;
 #[allow(dead_code)] // TODO: Remove when client code is added.
 mod tlv;
-#[allow(dead_code)] // TODO: Remove when client code is added.
+#[expect(dead_code)] // TODO: Remove when client code is added.
 mod xml;
