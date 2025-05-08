@@ -56,12 +56,6 @@ pub enum AraXmlError {
 
     #[error("Error decoding hex: {0}")]
     HexError(#[from] hex::FromHexError),
-
-    #[error("Invalid AID: {0}")]
-    InvalidAid(String),
-
-    #[error("Invalid device app ID: {0}")]
-    InvalidAppId(String),
 }
 
 /// Parse ARA rules from XML content in the provided [`Read`] object (e.g. a [`std::fs::File`]).

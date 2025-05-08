@@ -26,15 +26,15 @@
 //! that the only useful thing that can be done with errors is to log them so humans can examine
 //! and repair the rules.
 
-use std::collections::{btree_map::Entry, BTreeMap, BTreeSet};
-use std::{array::TryFromSliceError, cmp::Ordering};
-
+use super::{tlv, xml};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use itertools::{izip, Itertools};
 use log::{info, trace};
-
-use super::tlv;
-use super::xml;
+use std::{
+    array::TryFromSliceError,
+    cmp::Ordering,
+    collections::{btree_map::Entry, BTreeMap, BTreeSet},
+};
 
 #[cfg(test)]
 mod test;
@@ -229,12 +229,6 @@ impl RuleCache {
         }
     }
 
-    /// Convert parsed-XML object containing rules to a [`Vec<Rule>`], preparatory to creating a
-    /// [`RuleCache`] (perhaps containing rules from multiple sources).
-    pub fn xml_to_rules(xml: xml::Rules) -> Result<Vec<Rule>> {
-        xml.ref_ar_do.into_iter().map(Rule::from_xml).collect()
-    }
-
     /// Returns the APDU access restrictions for the specified device app and AID.  To check the
     /// default-selected applet specify [`AppletId::DefaultApplet`] for `aid`.
     pub fn get_apdu_rule(&self, app: &DeviceAppId, aid: &AppletId) -> &ApduAccessRule {
@@ -323,7 +317,7 @@ fn handle_app_shadowing(rules: &mut BTreeMap<MatchCriteria, AccessRules>) {
 /// be applied.
 ///
 /// Corresponds to REF-AR-DO.  See ARA-M page 68.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Rule {
     criteria: MatchCriteria,
     access: AccessRules,
@@ -337,7 +331,7 @@ impl Rule {
 
     /// Create a [`Rule`] from a [`tlv::Object`].  Returns [`Err`] if the object does not contain
     /// a valid REF-AR-DO structure.
-    fn from_tlv(tlv: tlv::Object) -> Result<Rule> {
+    pub(crate) fn from_tlv(tlv: tlv::Object) -> Result<Rule> {
         ensure!(*tlv.tag() == tlv::Tag::RefArDo);
         let value = tlv.get_content();
         let tlv::Value::Constructed(vec) = value else {
@@ -677,7 +671,7 @@ fn ascii_bytes_to_string(bytes: &[u8]) -> Result<String> {
 /// Defines the conditions for access.
 ///
 /// Corresponds to AR-DO, see ARA-M page 69.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AccessRules {
     apdu: ApduAccessRule,
     nfc: NfcAccessRule,
