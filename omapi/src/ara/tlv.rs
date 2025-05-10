@@ -20,11 +20,13 @@
 //! parse TLV-DER, and diagnose and report non-canonical encodings.  The ARA rule set is TLV-BER
 //! encoded, not TLV-DER, because canonicalization is not required.
 
+use std::fmt;
+
 use strum_macros::{Display, EnumIter};
 use thiserror::Error;
 
 /// Trait that defines a common interface for parsing things from bytes.
-trait Parseable<'a>: 'a + Sized {
+pub trait Parseable<'a>: 'a + Sized {
     fn parse(input: &'a [u8]) -> Result<(Self, &'a [u8]), TlvParseError>;
 }
 
@@ -65,6 +67,17 @@ impl<'a> Object<'a> {
     pub fn get_content(self) -> Value<'a> {
         self.value
     }
+
+    #[cfg(test)]
+    /// Generate BER encoding of [`self`].
+    pub fn to_ber(&self) -> Vec<u8> {
+        let value_ber = self.value.to_ber();
+
+        let mut ber = self.tag.bytes().to_vec();
+        ber.extend(Asn1Length(value_ber.len()).to_ber());
+        ber.extend(value_ber);
+        ber
+    }
 }
 
 impl<'a> Parseable<'a> for Object<'a> {
@@ -87,7 +100,7 @@ impl<'a> Parseable<'a> for Object<'a> {
 /// was empty, [`Value::Constructed`], meaning the value consists of a set of zero or more
 /// contained TLV objects, or [`Value::Primitive`], meaning the value does not contain other TLV
 /// objects, but only some primitive content.  Primitive content is provided only as a byte array.
-#[derive(Display, Debug, Clone, PartialEq)]
+#[derive(Display, Clone, PartialEq)]
 pub enum Value<'a> {
     Empty,
     Primitive(&'a [u8]),
@@ -108,11 +121,46 @@ impl<'a> Value<'a> {
 
         Ok((header.tag, value, &input[header.length.0..]))
     }
+
+    #[cfg(test)]
+    fn to_ber(&self) -> Vec<u8> {
+        match self {
+            Value::Empty => vec![],
+            Value::Primitive(data) => data.to_vec(),
+            Value::Constructed(objects) => {
+                objects.iter().map(Object::to_ber).collect::<Vec<_>>().concat()
+            }
+        }
+    }
 }
 
-struct Header {
+impl fmt::Debug for Value<'_> {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if fmt.alternate() {
+            match self {
+                Value::Empty => write!(fmt, "Empty"),
+                Value::Primitive(data) => write!(fmt, "Primitive (0x{})", hex::encode(data)),
+                Value::Constructed(objects) => write!(fmt, "Constructed ({objects:#?})"),
+            }
+        } else {
+            match self {
+                Value::Empty => write!(fmt, "[]"),
+                Value::Primitive(data) => write!(fmt, "[{}]", hex::encode(data)),
+                Value::Constructed(objects) => write!(fmt, "{objects:?}"),
+            }
+        }
+    }
+}
+
+pub struct Header {
     tag: Tag,
     length: Asn1Length,
+}
+
+impl Header {
+    pub fn len(&self) -> usize {
+        self.length.0
+    }
 }
 
 impl Parseable<'_> for Header {
@@ -136,6 +184,23 @@ impl Parseable<'_> for Asn1Length {
             Ok((Asn1Length((input[0] & 0x7F) as usize), &input[1..]))
         } else {
             parse_multi_byte_length(input)
+        }
+    }
+}
+
+#[cfg(test)]
+impl Asn1Length {
+    fn to_ber(&self) -> Vec<u8> {
+        match self.0 {
+            0..128 => vec![self.0 as u8],
+            128.. => {
+                // We don't need to canonicalize, but we'll do it anyway.
+                let be_bytes = self.0.to_be_bytes().to_vec();
+                let be_bytes = be_bytes.into_iter().skip_while(|b| *b == 0).collect::<Vec<u8>>();
+                let mut result = vec![be_bytes.len() as u8 | 0x80];
+                result.extend_from_slice(&be_bytes);
+                result
+            }
         }
     }
 }

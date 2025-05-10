@@ -16,7 +16,12 @@
 
 #![deny(missing_docs)]
 
+#[expect(dead_code)] // TODO: Remove when client code is added.
+mod access_enforcer;
 mod ara;
-#[allow(dead_code)] // TODO: Remove when client code is added.
+#[expect(dead_code)] // TODO: Remove when client code is added.
+mod system_services;
+#[expect(dead_code)] // TODO: Remove when client code is added.
 mod terminal;
+#[expect(dead_code)] // TODO: Remove when client code is added.
 mod utils;

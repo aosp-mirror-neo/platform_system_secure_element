@@ -44,8 +44,9 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 pub struct SendSelectOnClose(pub bool);
 
 const SELECT_DEFAULT_APDU: [u8; 4] = [0x00, 0xA4, 0x04, 0x00];
-const WRONG_LE_STATUS: u8 = 0x6C;
-const BYTES_TO_RECEIVE_STATUS: u8 = 0x61;
+const WRONG_LE_SW1: StatusByte = StatusByte(0x6C);
+const BYTES_TO_RECEIVE_SW1: StatusByte = StatusByte(0x61);
+const SUCCESS_STATUS: [u8; 2] = [0x90, 0x00];
 
 /// [`ChannelId`] is a newtype that identifies an SE channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -265,42 +266,28 @@ impl Terminal {
             return service_specific_exception(IoError, "Secure Element is not connected");
         }
 
-        let (mut response, sw1, sw2) = self.send_apdu(&apdu)?;
+        let mut response = self.send_apdu(&apdu)?;
 
-        if sw1 == WRONG_LE_STATUS {
-            sensitive!("Wrong Le field, re-sending with correct value {sw2:#04X}");
-            apdu.set_last(sw2);
+        if response.incorrect_le() {
+            sensitive!("Wrong Le field, re-sending with correct value {:?}", response.sw2());
+            apdu.set_le(response.sw2());
             return self.transmit_and_get_response(apdu).trace("transmit (corrected Le)");
-        } else if sw1 == BYTES_TO_RECEIVE_STATUS {
-            sensitive!("Response chaining requested, getting {sw2:#04X}");
-            loop {
-                let (mut get_data_rsp, sw1, sw2) =
-                    self.send_apdu(&Apdu::create_get_data_command(apdu.cla(), sw2))?;
-                response.extend_from_slice(&get_data_rsp);
-                get_data_rsp.zeroize();
-
-                if sw1 != BYTES_TO_RECEIVE_STATUS {
-                    response.extend_from_slice(&[sw1, sw2]);
-                }
-            }
-        } else {
-            response.extend_from_slice(&[sw1, sw2]);
         }
 
-        Ok(ApduResponse(response))
+        while response.get_data_required() {
+            sensitive!("Response chaining requested, getting {:?}", response.sw2());
+            let get_data_apdu = response.create_get_data_command(apdu.cla());
+            response.extend(self.send_apdu(&get_data_apdu)?);
+        }
+
+        Ok(response)
     }
 
     /// SECURITY NOTE:  APDU and response contents may be sensitive, so any copies must be
     /// zeroized and the content must not be logged, except with [`trace!`], which is disabled.
-    fn send_apdu(&self, apdu: &Apdu) -> Result<(Vec<u8>, /* sw1 */ u8, /* sw2 */ u8)> {
+    fn send_apdu(&self, apdu: &Apdu) -> Result<ApduResponse> {
         sensitive!("Transmitting: {apdu:?}");
-        let mut response = self.se_hal.transmit(&apdu.0).sensitive("transmit")?;
-        if response.len() < 2 {
-            return service_specific_exception(IoError, "Error in transmit(), too-short response");
-        }
-        let sw2 = response.pop().unwrap();
-        let sw1 = response.pop().unwrap();
-        Ok((response, sw1, sw2))
+        ApduResponse::new(self.se_hal.transmit(&apdu.0)?).sensitive("transmit")
     }
 
     /// Close all open channels on the [`Terminal`]
@@ -365,6 +352,28 @@ impl Terminal {
     }
 }
 
+/// [`StatusByte`] is a newtype for APDU response status bytes.  It exists so it can derive
+/// [`ZeroizeOnDrop`].  It's unclear if there are any situations in which status bytes are
+/// sensitive, but better safe than sorry.
+///
+/// SECURITY NOTE:  APDU and response contents may be sensitive, so any copies must be zeroized
+/// and the content must not be logged, except with [`sensitive!`].  To help ensure this,
+/// [`StatusByte`]'s implementation of [`std::fmt::Debug`] is a no-op when sensitive data logging
+/// is not enabled, and [`std::fmt::Display`] is not implemented.
+#[derive(Clone, ZeroizeOnDrop, PartialEq)]
+pub(crate) struct StatusByte(u8);
+
+impl std::fmt::Debug for StatusByte {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // This conditional shouldn't be necessary, since code should always use [`sensitive`] to
+        // trace APDU response data, but this helps protect against mistakes.
+        if cfg!(any(feature = "log_sensitive_data", test)) {
+            return write!(f, "{:#04X?}", self.0);
+        }
+        Ok(())
+    }
+}
+
 /// [`ApduResponse`]is a newtype for APDU response contents.  It exists primarily so it can derive
 /// [`ZeroizeOnDrop`].
 ///
@@ -378,23 +387,83 @@ pub(crate) struct ApduResponse(Vec<u8>);
 impl std::fmt::Debug for ApduResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // This conditional shouldn't be necessary, since code should always use [`sensitive`] to
-        // trace Apdus, but this helps protect against mistakes.
+        // trace APDU response data, but this helps protect against mistakes.
         if cfg!(any(feature = "log_sensitive_data", test)) {
-            write!(f, "{}", hex::encode(&self.0))
-        } else {
-            write!(f, "APDU elided for security")
+            return write!(f, "{}", hex::encode(&self.0));
         }
+        Ok(())
     }
 }
 
 impl ApduResponse {
-    /// Get a version of the ApduResponse data that can be manipulated, but will not be zeroized
-    /// on drop.  Don't call this method unless you are taking responsibility for zeroizing some
-    /// other way, or know the content is not sensitive.
-    pub(crate) fn convert_to_non_zeroizing_vec(&mut self) -> Vec<u8> {
-        let mut tmp = Vec::new();
-        std::mem::swap(&mut tmp, &mut self.0);
-        tmp
+    pub fn new(data: Vec<u8>) -> Result<Self> {
+        if data.len() < 2 {
+            return service_specific_exception(IoError, "Error in transmit(), too-short response");
+        }
+        Ok(Self(data))
+    }
+
+    /// Extend this response by appending the contents of `additional`.  The status word of `self`
+    /// is discarded and the result has the status word from `additional`.
+    ///
+    /// SECURITY NOTE:  The implementation of this method is a little tricky, because we need to
+    /// ensure we don't leave any copies of the data around in the heap.  So we can't use
+    /// `self.0.resize()`, nor can we pass `additional.0` to `Vec::append`, since that would
+    /// probably "move" the contents out of `additional.0` by copying them, leaving `additional.0`
+    /// empty so [`ZeroizeOnDrop`] does nothing.
+    pub fn extend(&mut self, additional: ApduResponse) {
+        if self.0.capacity() >= self.data_len() + additional.0.len() {
+            self.0.pop();
+            self.0.pop();
+            self.0.extend_from_slice(&additional.0);
+        } else {
+            let mut tmp = Vec::with_capacity(self.data_len() + additional.0.len());
+            tmp.extend_from_slice(self.risky_data());
+            tmp.extend_from_slice(&additional.0[..]);
+            std::mem::swap(&mut tmp, &mut self.0);
+            tmp.zeroize();
+        }
+    }
+
+    pub fn data_len(&self) -> usize {
+        self.0.len() - 2
+    }
+
+    pub fn successful(&self) -> bool {
+        self.0[self.0.len() - 2..] == SUCCESS_STATUS
+    }
+
+    /// Get a reference to the data portion of the response, as a slice.  This is labeled "risky"
+    /// because the caller must take care not to copy the slice content, unless the caller knows
+    /// that the content is not sensitive, or takes care to zeroize any copies.
+    pub fn risky_data(&self) -> &[u8] {
+        &self.0[..self.0.len() - 2]
+    }
+
+    /// Get a copy of the status portion of the response, as an array.  The caller must take care
+    /// zeroize the copy, unless the caller knows it is not sensitive.
+    pub fn non_zeroizing_status(&self) -> [u8; 2] {
+        self.0[self.0.len() - 2..].try_into().unwrap()
+    }
+
+    fn sw1(&self) -> StatusByte {
+        StatusByte(self.0[self.0.len() - 2])
+    }
+
+    fn sw2(&self) -> StatusByte {
+        StatusByte(self.0[self.0.len() - 1])
+    }
+
+    fn incorrect_le(&self) -> bool {
+        self.sw1() == WRONG_LE_SW1
+    }
+
+    fn get_data_required(&self) -> bool {
+        self.sw1() == BYTES_TO_RECEIVE_SW1
+    }
+
+    fn create_get_data_command(&self, cla: u8) -> Apdu {
+        Apdu(vec![cla, 0xC0, 0x00, 0x00, self.sw2().0])
     }
 }
 
@@ -476,11 +545,6 @@ impl Apdu {
         apdu
     }
 
-    /// Create a GET DATA command APDU with the specified class and Le (Length Expected) bytes.
-    pub fn create_get_data_command(cla: u8, le: u8) -> Self {
-        Self(vec![cla, 0xC0, 0x00, 0x00, le])
-    }
-
     /// Returns true if this APDU uses secure messaging, as indicated by the class byte.
     fn uses_secure_messaging(&self) -> bool {
         SecureMessagingConfiguration::new(self.cla())
@@ -528,9 +592,9 @@ impl Apdu {
     }
 
     /// Update the last byte of the APDU.
-    fn set_last(&mut self, value: u8) {
+    fn set_le(&mut self, value: StatusByte) {
         self.0.pop();
-        self.0.push(value);
+        self.0.push(value.0);
     }
 
     /// Get class byte

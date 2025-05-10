@@ -8,7 +8,7 @@ use binder::{BinderFeatures, ExceptionCode};
 use googletest::prelude::*;
 use googletest::test as gtest;
 use googletest::Result;
-use mockall::predicate as mp;
+use mockall::{predicate as mp, Sequence};
 
 #[cfg(not(feature = "notandroid"))]
 fn init() {
@@ -394,6 +394,118 @@ fn invalid_apdus() -> Result<()> {
         .concat(),
         ILLEGAL_ARGUMENT,
         "Lc is 65536 but is followed by 65535 byte(s)",
+    );
+
+    Ok(())
+}
+
+#[gtest]
+fn handle_le_correction() -> Result<()> {
+    init();
+
+    let mut seq = Sequence::new();
+    let se_binder = build_mock_se(|mock_se| {
+        mock_se.expect_openLogicalChannel().times(1).in_sequence(&mut seq).returning(|_, _| {
+            Ok(LogicalChannelResponse {
+                channelNumber: 1,
+                selectResponse: "ats".as_bytes().to_vec(),
+            })
+        });
+
+        // First APDU has Le 0, but SE will respond saying it should be two.
+        mock_se
+            .expect_transmit()
+            .with(mp::eq([0x01, 0x00, 0x00, 0x00, /* Le */ 0x00]))
+            .times(1)
+            .in_sequence(&mut seq)
+            // Return SW1 0x6C, indicating Le should be corrected, and SW2 to indicate correct
+            // value, in this case 2.
+            .returning(|_| Ok(vec![0x6C, 0x02]));
+
+        // Automatic resend should adjust the Le and return success with two bytes of data.
+        mock_se
+            .expect_transmit()
+            .with(mp::eq([0x01, 0x00, 0x00, 0x00, /* Le */ 0x02]))
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(vec![0x00, 0x00, 0x90, 0x00]));
+    });
+
+    let mut terminal = Terminal::new("se_name", se_binder)?;
+    terminal.set_connected(true);
+
+    let channel_id = terminal.open_logical_channel(&[], 0x00)?.unwrap();
+    // Although there will actually be two APDUs sent, the initial one and the corrected one, as
+    // far as the client knows, there's just one successful APDU.
+    let response =
+        terminal.transmit(channel_id, &[0x00, 0x00, 0x00, 0x00, /* Le */ 0x00], false)?;
+    assert_that!(response, eq(&ApduResponse(vec![0x00, 0x00, 0x90, 0x00])));
+
+    Ok(())
+}
+
+#[gtest]
+fn handle_response_chaining() -> Result<()> {
+    init();
+
+    let mut seq = Sequence::new();
+    let se_binder = build_mock_se(|mock_se| {
+        mock_se.expect_openLogicalChannel().times(1).in_sequence(&mut seq).returning(|_, _| {
+            Ok(LogicalChannelResponse {
+                channelNumber: 1,
+                selectResponse: "ats".as_bytes().to_vec(),
+            })
+        });
+        // First APDU has Le 0x10, but SE will respond with only the first four bytes and send
+        // status words indicating that GET DATA should be used to get the rest.
+        mock_se
+            .expect_transmit()
+            .with(mp::eq([0x01, 0x00, 0x00, 0x00, /* Le */ 0x10]))
+            .times(1)
+            .in_sequence(&mut seq)
+            // Return SW1 0x61, indicating that not all data was returned and SW 0x0C, indicating
+            // that 8 more bytes need to be retrieved
+            .returning(|_| Ok(vec![0x01, 0x02, 0x03, 0x04, 0x61, 0x0C]));
+        // Second APDU will be GET DATA, requesting 0x0C bytes.  Only return 4 and indicate
+        // another GET DATA is needed.
+        mock_se
+            .expect_transmit()
+            .with(mp::eq([0x01, 0xC0, 0x00, 0x00, /* Le */ 0x0C]))
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(vec![0x05, 0x06, 0x07, 0x08, 0x61, 0x08]));
+        // Third APDU will be GET DATA, requesting 0x08 bytes.  Only return 4 and indicate another
+        // GET DATA is needed.
+        mock_se
+            .expect_transmit()
+            .with(mp::eq([0x01, 0xC0, 0x00, 0x00, /* Le */ 0x08]))
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(vec![0x09, 0x0A, 0x0B, 0x0C, 0x61, 0x04]));
+        // Fourth and final APDU will be GET DATA, requesting 0x04 (12) bytes.  Return them and
+        // indicate success.
+        mock_se
+            .expect_transmit()
+            .with(mp::eq([0x01, 0xC0, 0x00, 0x00, /* Le */ 0x04]))
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(vec![0x0D, 0x0E, 0x0F, 0x10, 0x90, 0x00]));
+    });
+
+    let mut terminal = Terminal::new("se_name", se_binder)?;
+    terminal.set_connected(true);
+
+    let channel_id = terminal.open_logical_channel(&[], 0x00)?.unwrap();
+    // Although four APDUs are exchanged, to the client it appears there was only one, and it
+    // returned all 0x10 bytes of data.
+    let response =
+        terminal.transmit(channel_id, &[0x00, 0x00, 0x00, 0x00, /* Le */ 0x10], false)?;
+    assert_that!(
+        response,
+        eq(&ApduResponse(vec![
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+            0x0F, 0x10, 0x90, 0x00
+        ]))
     );
 
     Ok(())
