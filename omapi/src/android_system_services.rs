@@ -33,6 +33,9 @@ use packagemanager_aidl::aidl::android::content::pm::{
 };
 use std::{fs::File, sync::Mutex};
 
+#[cfg(test)]
+mod test;
+
 const DEBUG_BUILD_PROPERTY: &str = "ro.debuggable";
 const PACKAGE_MANAGER_NATIVE_SERVICE: &str = "package_native";
 const PROP_PRODUCT_HARDWARE_SKU: &str = "ro.boot.product.hardware.sku";
@@ -43,6 +46,17 @@ const UUID_MAPPING_CONFIG_PREFIX: &str = "hal_uuid_map_";
 const UUID_MAPPING_CONFIG_SUFFIX: &str = ".xml";
 const PLATFORM_RULES_PREFIX: &str = "se_access_rules_";
 const PLATFORM_RULES_SUFFIX: &str = ".xml";
+
+/// Value returned from checkPermission if the specified package has the specified permission.
+///
+/// See `PackageManager#PERMISSION_GRANTED` in
+/// `frameworks/base/core/java/android/content/pm/PackageManager.java`.
+const PERMISSION_GRANTED: i32 = 0;
+
+/// Range of uids allocated for an Android user.
+///
+/// See `UserHandle#PerUserRange` in `frameworks/base/core/java/android/os/UserHandle.java`.
+const PER_USER_RANGE: i32 = 100_000;
 
 #[derive(Debug)]
 struct AndroidSystemServicesData {
@@ -114,6 +128,38 @@ impl AndroidSystemServicesData {
             .dedup()
             .collect()
     }
+
+    fn is_uid_privileged(&self, caller_uid: i32) -> Result<bool> {
+        let package_manager = self.get_package_manager()?;
+
+        let package_names: Vec<String> = package_manager.getNamesForUids(&[caller_uid])?;
+
+        if package_names.is_empty() {
+            info!("No packages found for UID {caller_uid}");
+            return Ok(false);
+        }
+
+        for package_name in package_names {
+            match package_manager.checkPermission(
+                "android.permission.SECURE_ELEMENT_PRIVILEGED_OPERATION",
+                &package_name,
+                caller_uid / PER_USER_RANGE,
+            ) {
+                Err(e) => {
+                    error!("Error checking permission for package {package_name}: {e}");
+                    return Err(e);
+                }
+                Ok(PERMISSION_GRANTED) => {
+                    info!("Package {package_name} is privileged.");
+                    return Ok(true);
+                }
+                _ => {}
+            }
+        }
+
+        trace!("No privileged packages found for UID {caller_uid}");
+        Ok(false)
+    }
 }
 
 impl SystemServices for AndroidSystemServices {
@@ -159,10 +205,7 @@ impl SystemServices for AndroidSystemServices {
     }
 
     fn get_client_id(&self) -> binder::Result<ClientId> {
-        let caller_uid = binder::ThreadState::get_calling_uid().try_into().map_err(|uid| {
-            // This can only happen if the UID cannot be represented in [`i32`].
-            create_exception_status(ILLEGAL_ARGUMENT, &format!("Invalid UID {uid}"))
-        })?;
+        let caller_uid = get_caller_uid_i32()?;
 
         let uuids = self.0.get_caller_uuids(caller_uid);
         if uuids.is_empty() {
@@ -224,6 +267,10 @@ impl SystemServices for AndroidSystemServices {
         }
         Ok(result)
     }
+
+    fn is_caller_privileged(&self) -> Result<bool> {
+        self.0.is_uid_privileged(get_caller_uid_i32()?)
+    }
 }
 
 /// Returns true if the current build is debuggable.
@@ -273,5 +320,12 @@ fn config_files(file_name: &str) -> impl Iterator<Item = Result<Option<(String, 
                 &format!("Error attempting to open config file {path}: {e}"),
             )),
         }
+    })
+}
+
+fn get_caller_uid_i32() -> Result<i32> {
+    binder::ThreadState::get_calling_uid().try_into().map_err(|uid| {
+        // This can only happen if the UID cannot be represented in [`i32`].
+        create_exception_status(ILLEGAL_ARGUMENT, &format!("Invalid UID {uid}"))
     })
 }

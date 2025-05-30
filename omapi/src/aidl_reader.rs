@@ -78,6 +78,6 @@ impl ISecureElementReader for AidlReader {
 
     fn reset(&self) -> Result<bool> {
         self.trace_caller("reset");
-        Ok(self.reader().reset()).trace("reset")
+        self.reader().reset().trace("reset")
     }
 }

@@ -18,9 +18,7 @@
 
 pub mod tlv;
 
-#[allow(dead_code)] // TODO: Remove when client code is added.
 mod rules;
-#[allow(dead_code)] // TODO: Remove when client code is added.
 mod xml;
 
 pub use rules::{

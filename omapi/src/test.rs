@@ -414,6 +414,7 @@ fn mock_system_services(se: Strong<dyn ISecureElement>) -> Arc<dyn SystemService
         .returning(|| SeSecurityProfile { use_ara_applet: false, full_access: true });
     system_services.expect_get_platform_rules().returning(|_| Ok(vec![]));
     system_services.expect_get_se_hal().return_once(move |_, _| Ok(se));
+    system_services.expect_is_caller_privileged().returning(|| Ok(false));
     system_services.expect_get_client_id().returning(|| Ok(ClientId::PackageInfo(vec![])));
     Arc::new(system_services)
 }

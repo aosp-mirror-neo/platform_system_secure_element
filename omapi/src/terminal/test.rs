@@ -496,6 +496,69 @@ fn handle_response_chaining() -> Result<()> {
     Ok(())
 }
 
+#[gtest]
+fn transmit_disallowed_iso_commands_non_privileged() -> Result<()> {
+    init();
+
+    let se_binder = build_mock_se(|mock_se| {
+        mock_se.expect_openLogicalChannel().times(1).returning(|_, _| {
+            Ok(LogicalChannelResponse { channelNumber: 1, selectResponse: vec![] })
+        });
+    });
+
+    let mut terminal = Terminal::new("se_name", se_binder)?;
+    terminal.set_connected(true);
+    let channel_id = terminal.open_logical_channel(&[], 0x00)?.unwrap();
+
+    // SELECT by DF name (ISO CLA, INS 0xA4, P1 0x04)
+    let err = terminal.transmit(channel_id, &[0x00, 0xA4, 0x04, 0x00], false).unwrap_err();
+    assert_that!(err.to_string(), contains_substring("SELECT by DF name command not allowed"));
+
+    // MANAGE CHANNEL (ISO CLA, INS 0x70)
+    let err = terminal.transmit(channel_id, &[0x00, 0x70, 0x00, 0x00], false).unwrap_err();
+    assert_that!(err.to_string(), contains_substring("MANAGE CHANNEL command not allowed"));
+
+    Ok(())
+}
+
+#[gtest]
+fn transmit_disallowed_iso_commands_privileged() -> Result<()> {
+    init();
+
+    let se_binder = build_mock_se(|mock_se| {
+        mock_se.expect_openLogicalChannel().times(1).returning(|_, _| {
+            Ok(LogicalChannelResponse { channelNumber: 1, selectResponse: vec![] })
+        });
+        mock_se.expect_transmit().returning(|_| Ok(vec![0x90, 0x00]));
+    });
+
+    let mut terminal = Terminal::new("se_name", se_binder)?;
+    terminal.set_connected(true);
+    let channel_id = terminal.open_logical_channel(&[], 0x00)?.unwrap();
+
+    // SELECT by DF name (ISO CLA, INS 0xA4, P1 0x04) should be allowed for privileged
+    let response = terminal.transmit(channel_id, &[0x00, 0xA4, 0x04, 0x00], true)?;
+    assert_that!(response, eq(&ApduResponse(vec![0x90, 0x00])));
+
+    // MANAGE CHANNEL (ISO CLA, INS 0x70) should also be allowed for privileged
+    let response = terminal.transmit(channel_id, &[0x00, 0x70, 0x00, 0x00], true)?;
+    assert_that!(response, eq(&ApduResponse(vec![0x90, 0x00])));
+
+    // SELECT by DF name with GP secure messaging (CLA = 0x84, INS 0xA4, P1 0x04).  Note that a
+    // real GP secure messaging implementation would require data to be encrypted and the header
+    // and data to be authenticated, so a client can use a GP SM header to get by the
+    // error-checking in `Terminal`, but the SE would reject the APDU if secure messaging has not
+    // been set up or the APDU authentication is incorrect.
+    let response = terminal.transmit(channel_id, &[0x84, 0xA4, 0x04, 0x00], false)?;
+    assert_that!(response, eq(&ApduResponse(vec![0x90, 0x00])));
+
+    // MANAGE CHANNEL with GP secure messaging (CLA = 0x84, INS 0x70)
+    let response = terminal.transmit(channel_id, &[0x84, 0x70, 0x00, 0x00], false)?;
+    assert_that!(response, eq(&ApduResponse(vec![0x90, 0x00])));
+
+    Ok(())
+}
+
 fn build_mock_se(expectations: impl FnOnce(&mut MockISecureElement)) -> Strong<dyn ISecureElement> {
     let mut se_mock = MockISecureElement::new();
     expectations(&mut se_mock);

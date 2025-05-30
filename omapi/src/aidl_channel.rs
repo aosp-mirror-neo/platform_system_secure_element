@@ -16,8 +16,8 @@
 //! work to the contained [`Reader`].
 
 use crate::{
-    ara::{ApduAccessRule, ApduHeader},
-    reader::Reader,
+    ara::ApduHeader,
+    reader::{AccessPolicy, Reader},
     terminal::{ChannelId, SendSelectOnClose},
     utils::{binder_exception, create_exception_status, TraceResultExt},
 };
@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex, Weak};
 pub struct AidlChannel {
     reader: Arc<Mutex<Reader>>,
     id: ChannelId,
-    policy: ApduAccessRule,
+    policy: AccessPolicy,
     _death_recipient: DeathRecipient,
 }
 
@@ -44,7 +44,7 @@ impl AidlChannel {
     pub fn new_native_binder(
         reader: Arc<Mutex<Reader>>,
         id: ChannelId,
-        policy: ApduAccessRule,
+        policy: AccessPolicy,
         listener: &Strong<dyn ISecureElementListener>,
     ) -> Strong<dyn ISecureElementChannel> {
         let mut death_recipient = build_death_recipient(Arc::downgrade(&reader), id);
@@ -53,11 +53,6 @@ impl AidlChannel {
         }
         let channel = AidlChannel { reader, id, policy, _death_recipient: death_recipient };
         BnSecureElementChannel::new_binder(channel, BinderFeatures::default())
-    }
-
-    fn is_privileged_caller(&self) -> bool {
-        // TODO: Implement this.
-        false
     }
 
     fn trace_caller(&self, method: &str) {
@@ -129,7 +124,7 @@ impl ISecureElementChannel for AidlChannel {
             self.reader
                 .lock()
                 .unwrap()
-                .transmit_on_channel(self.id, apdu, self.is_privileged_caller())
+                .transmit_on_channel(self.id, apdu, self.policy.privileged_caller())
                 // The copied response vector should zeroized by the binder infrastructure
                 .map(|response| response.non_zeroizing_vec())
                 .trace("transmit")

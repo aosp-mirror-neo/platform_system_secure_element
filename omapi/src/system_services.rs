@@ -46,6 +46,9 @@ pub trait SystemServices: std::fmt::Debug + Send + Sync {
 
     /// Returns the platform security rules for the specified SE
     fn get_platform_rules(&self, se_name: &str) -> Result<Vec<Rule>>;
+
+    /// Returns true if the current binder caller has privileged access.
+    fn is_caller_privileged(&self) -> Result<bool>;
 }
 
 #[derive(Debug, Clone, Copy)]
