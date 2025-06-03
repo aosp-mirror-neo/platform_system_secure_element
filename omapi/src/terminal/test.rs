@@ -1,5 +1,5 @@
 use super::*;
-use crate::utils::create_exception_status;
+use crate::{test_utils::init, utils::create_exception_status};
 use android_hardware_secure_element::aidl::android::hardware::secure_element::{
     ISecureElement::{BnSecureElement, MockISecureElement},
     LogicalChannelResponse::LogicalChannelResponse,
@@ -9,25 +9,6 @@ use googletest::prelude::*;
 use googletest::test as gtest;
 use googletest::Result;
 use mockall::{predicate as mp, Sequence};
-
-#[cfg(not(feature = "notandroid"))]
-fn init() {
-    android_logger::init_once(
-        android_logger::Config::default()
-            .with_tag("se_service_terminal_test")
-            .with_max_level(log::LevelFilter::Trace)
-            .with_log_buffer(android_logger::LogId::System)
-            .format(|buf, record| {
-                writeln!(
-                    buf,
-                    "{}:{} - {}",
-                    record.file().unwrap_or("unknown"),
-                    record.line().unwrap_or(0),
-                    record.args()
-                )
-            }),
-    );
-}
 
 #[gtest]
 fn create_terminal() -> Result<()> {
