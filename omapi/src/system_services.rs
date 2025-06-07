@@ -14,11 +14,39 @@
 
 //! This module defines a trait that provides information from the system.
 
+pub use crate::ara::{Rule, Sha1DigestOrUuid, Sha256Digest};
+use android_hardware_secure_element::aidl::android::hardware::secure_element::ISecureElement::ISecureElement;
+use binder::{Result, Strong};
 use bssl_crypto::digest::{InsecureSha1, Sha256};
 use itertools::Itertools;
 use std::fmt::Display;
 
-use crate::ara::{Sha1DigestOrUuid, Sha256Digest};
+/// Newtype to specify whether to wait for an SE HAL service to become available.
+pub struct WaitForReader(pub bool);
+
+/// Trait that provides access to system services needed by libse_service.
+#[mockall::automock]
+pub trait SystemServices: std::fmt::Debug + Send + Sync {
+    /// Returns an SE HAL binder object for the specified SE name.  If `wait` is true, will wait
+    /// until the SE HAL is available (potentially waiting forever).
+    fn get_se_hal(&self, se_name: &str, wait: WaitForReader) -> Result<Strong<dyn ISecureElement>>;
+
+    /// Returns the UUID(s) and certificate hash(es) of the calling device application.
+    fn get_client_id(&self) -> Result<ClientId>;
+
+    /// Returns [`ClientId`]s for teach of the provided set of package names, for the specified user ID.
+    fn get_client_ids_for_packages(
+        &self,
+        package_names: &[String],
+        user_id: i32,
+    ) -> Result<Vec<ClientId>>;
+
+    /// Returns the platform security configuration.
+    fn get_security_profile(&self) -> SeSecurityProfile;
+
+    /// Returns the platform security rules for the specified SE
+    fn get_platform_rules(&self, se_name: &str) -> Result<Vec<Rule>>;
+}
 
 #[derive(Debug, Clone, Copy)]
 /// [`SeSecurityProfile`] defines overall policy for access control to SE applets.  In general,
