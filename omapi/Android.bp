@@ -18,6 +18,7 @@ rust_defaults {
     srcs: ["src/lib.rs"],
     rustlibs: [
         "android.hardware.secure_element-V1-rust",
+        "android.se.omapi-V2-rust",
         "libandroid_logger",
         "libanyhow",
         "libbinder_rs",

@@ -67,6 +67,18 @@ trait Traceable {
     fn trace_string(&self) -> String;
 }
 
+/// Enable tracing of two-tuples.
+impl<A, B> Traceable for (A, B)
+where
+    A: std::fmt::Debug,
+    B: std::fmt::Debug,
+{
+    fn trace_string(&self) -> String {
+        format!("{self:?}")
+    }
+}
+
+/// Enable tracing of [`Vec<u8>`].
 impl Traceable for Vec<u8> {
     fn trace_string(&self) -> String {
         hex::encode(self)
@@ -95,9 +107,13 @@ macro_rules! trace_debug {
     };
 }
 
+trace_debug!(());
 trace_debug!(Apdu);
 trace_debug!(ApduResponse);
 trace_debug!(RefreshTagDo);
+trace_debug!(bool);
+trace_debug!(Vec<bool>);
+trace_debug!(Vec<String>);
 
 /// Provide an easy way to trace [`Traceable`] values that are about to be returned.  That is,
 /// supposing `result` is [`Traceable`] and is being returned from a function:

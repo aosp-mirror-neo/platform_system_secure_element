@@ -446,6 +446,13 @@ impl ApduResponse {
         self.0[self.0.len() - 2..].try_into().unwrap()
     }
 
+    /// Get a copy of the whole response as a vector that will not zeroize itself.  The caller
+    /// must arrange some other way for the output vector to be zeroized, unless the caller knows
+    /// that the content is not sensitive.
+    pub fn non_zeroizing_vec(&self) -> Vec<u8> {
+        self.0.to_vec()
+    }
+
     fn sw1(&self) -> StatusByte {
         StatusByte(self.0[self.0.len() - 2])
     }
