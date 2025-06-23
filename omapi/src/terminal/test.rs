@@ -1,5 +1,5 @@
 use super::*;
-use crate::{test_utils::init, utils::create_exception_status};
+use crate::utils::create_exception_status;
 use android_hardware_secure_element::aidl::android::hardware::secure_element::{
     ISecureElement::{BnSecureElement, MockISecureElement},
     LogicalChannelResponse::LogicalChannelResponse,
@@ -9,6 +9,10 @@ use googletest::prelude::*;
 use googletest::test as gtest;
 use googletest::Result;
 use mockall::{predicate as mp, Sequence};
+
+fn init() {
+    crate::test_utils::init(module_path!());
+}
 
 #[gtest]
 fn create_terminal() -> Result<()> {

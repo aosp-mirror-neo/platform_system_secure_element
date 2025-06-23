@@ -17,9 +17,12 @@ use log::trace;
 
 use super::tlv::{Object, Tag, Value};
 use super::*;
-use crate::test_utils::init;
 use googletest::prelude::*;
 use googletest::test as gtest;
+
+fn init() {
+    crate::test_utils::init(module_path!());
+}
 
 #[gtest]
 fn test_apdu_access_rule_merging() -> Result<()> {

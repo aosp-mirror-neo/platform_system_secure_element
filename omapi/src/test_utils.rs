@@ -14,10 +14,10 @@
 
 //! Utility functions used only in tests.
 
-pub fn init() {
+pub fn init(module_path: &str) {
     android_logger::init_once(
         android_logger::Config::default()
-            .with_tag("se_service_rules_test")
+            .with_tag(format!("libse_service_test::{module_path}"))
             .with_max_level(log::LevelFilter::Trace)
             .with_log_buffer(android_logger::LogId::System)
             .format(|buf, record| {

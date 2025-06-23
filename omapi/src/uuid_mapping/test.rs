@@ -15,9 +15,12 @@
 //! Unit tests for uuid_mapping.rs
 
 use super::*;
-use crate::test_utils::init;
 use googletest::prelude::*;
 use googletest::test as gtest;
+
+fn init() {
+    crate::test_utils::init(module_path!());
+}
 
 #[gtest]
 fn test_parser() -> Result<()> {

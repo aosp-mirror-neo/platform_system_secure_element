@@ -19,7 +19,6 @@ use super::*;
 use crate::{
     ara::Rule,
     system_services::{ClientId, MockSystemServices, SeSecurityProfile},
-    test_utils::init,
     utils::ServiceSpecificException,
 };
 use android_hardware_secure_element::aidl::android::hardware::secure_element::{
@@ -31,6 +30,10 @@ use googletest::{prelude::*, test as gtest, Result};
 
 const DEFAULT_AID: &[u8] = &[];
 const TEST_P2: i8 = 0x00;
+
+fn init() {
+    crate::test_utils::init(module_path!());
+}
 
 #[gtest]
 fn create_reader() -> Result<()> {
