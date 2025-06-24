@@ -22,12 +22,14 @@ mod aidl_reader;
 mod aidl_session;
 mod ara;
 mod reader;
-#[expect(dead_code)] // TODO: Remove when client code is added.
 mod se_service;
-#[expect(dead_code)] // TODO: Remove when client code is added.
 mod system_services;
 mod terminal;
 mod utils;
+#[allow(dead_code)] // TODO: Remove when client code is added.
+mod uuid_mapping;
+
+pub use se_service::SecureElementService;
 
 #[cfg(test)]
 mod test;

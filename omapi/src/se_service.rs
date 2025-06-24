@@ -16,9 +16,12 @@ use crate::{
     aidl_reader::AidlReader,
     reader::Reader,
     system_services::{SystemServices, WaitForReader},
-    utils::create_exception_status,
+    utils::{binder_exception, create_exception_status, TraceResultExt},
 };
-use android_se_omapi::aidl::android::se::omapi::ISecureElementReader::ISecureElementReader;
+use android_se_omapi::aidl::android::se::omapi::{
+    ISecureElementReader::ISecureElementReader,
+    ISecureElementService::{BnSecureElementService, ISecureElementService},
+};
 use binder::{ExceptionCode::ILLEGAL_ARGUMENT, Result, Strong};
 use log::{debug, info, trace};
 use std::{
@@ -58,16 +61,20 @@ impl ReaderType {
     }
 }
 
-/// [`SeService`]` implements the secure element service.  It allows clients to query for the list
-/// of available [`Reader`]s and retrieve one, and to query whether a client should be allowed to
-/// receive NFC events related to a reader and AID.  It's also responsible for enumerating the
-/// available [`Reader`]s on startup.
-pub struct SeService {
+/// [`SecureElementService`]` implements the secure element service.  It allows clients to query
+/// for the list of available [`Reader`]s and retrieve one, and to query whether a client should
+/// be allowed to receive NFC events related to a reader and AID.  It's also responsible for
+/// enumerating the available [`Reader`]s on startup.
+pub struct SecureElementService {
     readers: HashMap<String, ReaderRefs>,
 }
 
-impl SeService {
-    pub fn new(system_services: Arc<dyn SystemServices>) -> Self {
+impl SecureElementService {
+    /// Creates a new [`SecureElementService`] and enumerates all available Secure Element
+    /// readers.
+    pub fn new_native_binder(
+        system_services: Arc<dyn SystemServices>,
+    ) -> Strong<dyn ISecureElementService> {
         info!("Enumerating readers");
 
         let mut readers = HashMap::new();
@@ -76,34 +83,49 @@ impl SeService {
         }
         debug!("Done enumerating readers, found: {:?}", readers.keys());
 
-        SeService { readers }
+        BnSecureElementService::new_binder(
+            SecureElementService { readers },
+            binder::BinderFeatures::default(),
+        )
+    }
+}
+
+impl binder::Interface for SecureElementService {}
+
+impl ISecureElementService for SecureElementService {
+    fn getReaders(&self) -> Result<Vec<String>> {
+        Ok(self.readers.keys().cloned().collect()).trace("getReaders")
     }
 
-    pub fn get_readers(&self) -> Vec<String> {
-        self.readers.keys().cloned().collect()
-    }
-
-    pub fn get_reader(&self, reader: &str) -> Result<Strong<dyn ISecureElementReader>> {
+    fn getReader(&self, reader: &str) -> Result<Strong<dyn ISecureElementReader>> {
         self.readers
             .get(reader)
             .map(|se_binder| se_binder.binder_ref.clone())
             .ok_or_else(|| create_invalid_reader_exception(reader))
     }
 
-    pub fn is_nfc_event_allowed(
+    fn isNfcEventAllowed(
         &self,
         reader: &str,
         aid: Option<&[u8]>,
-        package_names: &[String],
+        package_names: Option<&[Option<String>]>,
         user_id: i32,
-    ) -> Result<Vec<bool>> {
-        self.readers
+    ) -> Result<Option<Vec<bool>>> {
+        let package_names = filter_out_none_or_empty(package_names.unwrap_or_default());
+        if package_names.is_empty() {
+            return binder_exception(ILLEGAL_ARGUMENT, "No package names specified");
+        }
+
+        let result = self
+            .readers
             .get(reader)
             .ok_or_else(|| create_invalid_reader_exception(reader))?
             .reader_arc
             .lock()
             .unwrap()
-            .is_nfc_event_allowed(aid, package_names, user_id)
+            .is_nfc_event_allowed(aid, &package_names, user_id)
+            .trace("isNfcEventAllowed")?;
+        Ok(Some(result))
     }
 }
 
@@ -143,6 +165,16 @@ fn enumerate_readers(
 
 fn build_reader_name(name_prefix: &str, index: usize) -> String {
     format!("{name_prefix}{index}")
+}
+
+fn filter_out_none_or_empty(package_names: &[Option<String>]) -> Vec<String> {
+    package_names
+        .iter()
+        .filter_map(|name_opt| match name_opt {
+            Some(name) if !name.is_empty() => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn create_invalid_reader_exception(reader: &str) -> binder::Status {
