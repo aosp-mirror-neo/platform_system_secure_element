@@ -465,7 +465,7 @@ impl MatchCriteria {
     fn matches(&self, app_id: &DeviceAppId, aid: &AppletId) -> bool {
         self.aid_ref.matches(aid)
             && self.hash_ref.matches(app_id)
-            && self.pkg_ref.as_ref().map_or(true, |p| p.matches(app_id))
+            && self.pkg_ref.as_ref().is_none_or(|p| p.matches(app_id))
     }
 
     /// Calculate the specificity-derived priority of a rule from the booleans indicating whether
