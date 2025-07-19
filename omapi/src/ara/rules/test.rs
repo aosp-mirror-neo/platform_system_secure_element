@@ -58,7 +58,7 @@ fn test_apdu_access_rule_merging() -> Result<()> {
     // For all combinations, check that merging produces rule that is at least as restrictive.
     for (a, b) in values.iter().cartesian_product(values.iter()) {
         let mut merged = a.clone();
-        merged.merge(b.clone());
+        merged.merge(b);
 
         assert!(is_at_least_as_restrictive(&merged, a), "A: {a:?}\nB: {b:?}\nM: {merged:?}\n");
         assert!(is_at_least_as_restrictive(&merged, b), "A: {a:?}\nB: {b:?}\nM: {merged:?}\n");
@@ -74,7 +74,7 @@ fn test_apdu_access_rule_partial_allow_merging() -> Result<()> {
     // The merge of two distinct PartialAllows is different; it combines the filters.
     let mut rule =
         ApduAccessRule::PartialAllow(ApduFilterSet::from_data(&[0, 1, 2, 3, 4, 5, 6, 7])?);
-    rule.merge(ApduAccessRule::PartialAllow(ApduFilterSet::from_data(&[7, 6, 5, 4, 3, 2, 1, 0])?));
+    rule.merge(&ApduAccessRule::PartialAllow(ApduFilterSet::from_data(&[7, 6, 5, 4, 3, 2, 1, 0])?));
     if let ApduAccessRule::PartialAllow(filter) = rule {
         assert!(
             filter == ApduFilterSet::from_data(&[7, 6, 5, 4, 3, 2, 1, 0, 0, 1, 2, 3, 4, 5, 6, 7,])?
@@ -91,19 +91,19 @@ fn test_nfc_access_rule_merging() {
     init();
 
     let mut rule = NfcAccessRule::Always;
-    rule.merge(NfcAccessRule::Never);
+    rule.merge(&NfcAccessRule::Never);
     assert_eq!(rule, NfcAccessRule::Never);
 
     let mut rule = NfcAccessRule::Never;
-    rule.merge(NfcAccessRule::Always);
+    rule.merge(&NfcAccessRule::Always);
     assert!(rule == NfcAccessRule::Never);
 
     let mut rule = NfcAccessRule::Never;
-    rule.merge(NfcAccessRule::Never);
+    rule.merge(&NfcAccessRule::Never);
     assert!(rule == NfcAccessRule::Never);
 
     let mut rule = NfcAccessRule::Always;
-    rule.merge(NfcAccessRule::Always);
+    rule.merge(&NfcAccessRule::Always);
     assert!(rule == NfcAccessRule::Always);
 }
 
@@ -181,7 +181,7 @@ fn test_invalid_access_rules() -> Result<()> {
     init();
 
     fn expect_fail(tlv: Object, want_err: &str) {
-        let err = AccessRules::from_tlv(tlv).unwrap_err();
+        let err = AraMAccessRules::from_tlv(tlv).unwrap_err();
         assert!(err.to_string().contains(want_err));
     }
 
@@ -210,7 +210,7 @@ fn test_invalid_access_rules() -> Result<()> {
         "Invalid tag PkgRefDo",
     );
 
-    let contains_unknown = AccessRules::from_tlv(Object::new(
+    let contains_unknown = AraMAccessRules::from_tlv(Object::new(
         Tag::ArDo,
         Value::Constructed(vec![
             Object::new(Tag::ApduArDo, Value::Primitive(&[0x00])),
@@ -335,77 +335,103 @@ fn test_invalid_match_criteria_structure() -> Result<()> {
 
     // Missing AID and app
     expect_that!(
-        MatchCriteria::from_tlv(Object::new(Tag::RefDo, Value::Constructed(vec![])))
+        AraMMatchCriteria::from_tlv(Object::new(Tag::RefDo, Value::Constructed(vec![])),)
             .unwrap_err()
+            .root_cause()
             .to_string(),
-        contains_substring("Found empty REF-DO")
+        contains_substring("Found empty ARA-M RefDo")
     );
 
     // Missing app
     expect_that!(
-        MatchCriteria::from_tlv(Object::new(
+        AraMMatchCriteria::from_tlv(Object::new(
             Tag::RefDo,
             Value::Constructed(vec![Object::new(Tag::AidRefDoImplicit, Value::Empty)]),
-        ))
+        ),)
         .unwrap_err()
+        .root_cause()
         .to_string(),
-        contains_substring("No DeviceAppId-REF-DO")
+        contains_substring("Missing DeviceAppId-REF-DO")
     );
 
     // Extra entry
     expect_that!(
-        MatchCriteria::from_tlv(Object::new(
+        AraMMatchCriteria::from_tlv(Object::new(
             Tag::RefDo,
             Value::Constructed(vec![
                 Object::new(Tag::AidRefDoImplicit, Value::Empty),
                 Object::new(Tag::DeviceAppIdRefDo, Value::Empty),
                 Object::new(Tag::DeviceAppIdRefDo, Value::Empty)
             ]),
-        ))
+        ),)
         .unwrap_err()
+        .root_cause()
         .to_string(),
-        contains_substring("Found 3 components")
+        contains_substring("Found unexpected DeviceAppIdRefDo")
     );
 
     // AID and DeviceAppID out of order
     expect_that!(
-        MatchCriteria::from_tlv(Object::new(
+        AraMMatchCriteria::from_tlv(Object::new(
             Tag::RefDo,
             Value::Constructed(vec![
                 Object::new(Tag::DeviceAppIdRefDo, Value::Empty),
                 Object::new(Tag::AidRefDoImplicit, Value::Empty),
             ])
-        ))
+        ),)
         .unwrap_err()
+        .root_cause()
         .to_string(),
-        contains_substring("AID-REF-DO found in position 1")
+        contains_substring("expected AID-REF-DO")
     );
 
-    // AID and PKG-REF
+    // AID and PKG-REF (mix of ARA-M and ARA-D elements, parsed as ARA-M)
     expect_that!(
-        MatchCriteria::from_tlv(Object::new(
+        AraMMatchCriteria::from_tlv(Object::new(
             Tag::RefDo,
             Value::Constructed(vec![
                 Object::new(Tag::AidRefDoImplicit, Value::Empty),
                 Object::new(Tag::PkgRefDo, Value::Empty),
             ])
-        ))
+        ),)
         .unwrap_err()
+        .root_cause()
         .to_string(),
-        contains_substring("PKG-REF-DO not preceded by DeviceAppID")
+        contains_substring("Invalid tag PkgRefDo")
+    );
+
+    // AID and PKG-REF (mix of ARA-M and ARA-D elements, parsed as ARA-D)
+    expect_that!(
+        AraDMatchCriteria::from_tlv(Object::new(
+            Tag::RefDo,
+            Value::Constructed(vec![
+                Object::new(Tag::AidRefDoImplicit, Value::Empty),
+                Object::new(Tag::PkgRefDo, Value::Empty),
+            ])
+        ),)
+        .unwrap_err()
+        .root_cause()
+        .to_string(),
+        contains_substring("Invalid tag AidRefDoImplicit")
     );
 
     // Invalid content type
-    let e = MatchCriteria::from_tlv(Object::new(Tag::RefDo, Value::Primitive(&[])))
-        .unwrap_err()
-        .to_string();
-    assert!(e.contains("Invalid RefDo content Primitive"), "{e}");
     expect_that!(
-        MatchCriteria::from_tlv(Object::new(Tag::RefDo, Value::Empty)).unwrap_err().to_string(),
-        contains_substring("Invalid RefDo content Empty")
+        AraMMatchCriteria::from_tlv(Object::new(Tag::RefDo, Value::Primitive(&[])))
+            .unwrap_err()
+            .root_cause()
+            .to_string(),
+        contains_substring("Invalid content Primitive for RefDo")
+    );
+    expect_that!(
+        AraMMatchCriteria::from_tlv(Object::new(Tag::RefDo, Value::Empty))
+            .unwrap_err()
+            .root_cause()
+            .to_string(),
+        contains_substring("Invalid content Empty for RefDo")
     );
 
-    let contains_unknown = MatchCriteria::from_tlv(Object::new(
+    let contains_unknown = AraMMatchCriteria::from_tlv(Object::new(
         Tag::RefDo,
         Value::Constructed(vec![
             Object::new(Tag::AidRefDoImplicit, Value::Empty),
@@ -468,7 +494,7 @@ fn test_empty_rule_set() -> Result<()> {
 
     let tlv = Object::new(Tag::ResponseAllRefArDo, Value::Empty);
 
-    let rule_set = RuleCache::from_tlv(tlv)?;
+    let rule_set = RuleSet::new(build_rules_from_ara_m_tlv(tlv)?);
     assert!(rule_set.rules.is_empty());
 
     assert_eq!(
@@ -485,65 +511,63 @@ fn test_empty_rule_set() -> Result<()> {
 #[gtest]
 fn test_unknown_in_rule_set() -> Result<()> {
     let tlv = rule_set(vec![Object::new(Tag::new(&[0x00]), Value::Empty)]);
+    let result = build_rules_from_ara_m_tlv(tlv);
 
     if cfg!(feature = "disallow_unknown_ara_tags") {
-        expect_that!(
-            RuleCache::from_tlv(tlv).unwrap_err().root_cause().to_string(),
-            contains_substring("Unknown")
-        );
+        expect_that!(result.unwrap_err().root_cause().to_string(), contains_substring("Unknown"));
     } else {
-        expect_that!(RuleCache::from_tlv(tlv), ok(anything()));
+        expect_that!(result, ok(anything()));
     }
 
     Ok(())
 }
 
-#[test]
+#[gtest]
 fn test_access_rule_translation_nfc_defaults() -> Result<()> {
     init();
 
     // APDU NEVER, no NFC -> NFC NEVER
     assert_eq!(
-        AccessRules::from_tlv(access_rule(apdu_access_never(), no_rule()))?.nfc,
+        AraMAccessRules::from_tlv(access_rule(apdu_access_never(), no_rule()))?.nfc,
         NfcAccessRule::Never
     );
 
     // APDU ALWAYS, no NFC -> NFC ALWAYS
     assert_eq!(
-        AccessRules::from_tlv(access_rule(apdu_access_always(), no_rule()))?.nfc,
+        AraMAccessRules::from_tlv(access_rule(apdu_access_always(), no_rule()))?.nfc,
         NfcAccessRule::Always
     );
 
     // APDU FILTER, no NFC -> NFC ALWAYS
     assert_eq!(
-        AccessRules::from_tlv(access_rule(apdu_access_filtered(&[0; 8]), no_rule()))?.nfc,
+        AraMAccessRules::from_tlv(access_rule(apdu_access_filtered(&[0; 8]), no_rule()))?.nfc,
         NfcAccessRule::Always
     );
 
     Ok(())
 }
 
-#[test]
+#[gtest]
 fn test_access_rule_translation_apdu_defaults() -> Result<()> {
     init();
 
     // no APDU, NFC NEVER -> APDU NEVER
     assert_eq!(
-        AccessRules::from_tlv(access_rule(no_rule(), nfc_access_never()))?.apdu,
+        AraMAccessRules::from_tlv(access_rule(no_rule(), nfc_access_never()))?.apdu,
         ApduAccessRule::Never
     );
 
     // no APDU, NFC ALWAYS -> APDU NEVER
     assert_eq!(
-        AccessRules::from_tlv(access_rule(no_rule(), nfc_access_always()))?.apdu,
+        AraMAccessRules::from_tlv(access_rule(no_rule(), nfc_access_always()))?.apdu,
         ApduAccessRule::Never
     );
 
     Ok(())
 }
 
-#[test]
-fn test_zen_rule_set() -> Result<()> {
+#[gtest]
+fn test_ara_m_zen_rule_set() -> Result<()> {
     init();
 
     let app0 = &DeviceAppId::new_apk(vec![[0; 32].into()], vec![], vec![]);
@@ -560,7 +584,7 @@ fn test_zen_rule_set() -> Result<()> {
     let applet4 = &AppletId::new(&[4; 5]);
     let applet5 = &AppletId::new(&[5; 5]);
 
-    let tlv_rule_set = rule_set(vec![
+    let ara_m_rule_set = rule_set(vec![
         // Allow all apps to access applet0
         rule(
             matcher(match_aid(applet0), match_any_app()),
@@ -611,9 +635,6 @@ fn test_zen_rule_set() -> Result<()> {
             matcher(match_aid(applet4), match_app_sha256(app0)),
             access_rule(apdu_access_always(), nfc_access_never()),
         ),
-        // Allow app 4 carrier-privileged access, but only with right package name.  Note that
-        // carrier rules do not participate in shadowing, so app4 also has access to applet4.
-        rule(match_carrier(app4), access_rule(apdu_access_always(), nfc_access_always())),
         // Allow app 5, a system component, access to applet2, but APDU only, no NFC.
         rule(
             matcher(match_aid(applet2), match_uuid(app5)),
@@ -621,7 +642,27 @@ fn test_zen_rule_set() -> Result<()> {
         ),
     ]);
 
-    let rules = RuleCache::from_tlv(tlv_rule_set)?;
+    let ara_d_rule_set = rule_set(vec![
+        // Allow app 4 carrier-privileged access, but only with right package name.
+        // Carrier-privilege allows access to all apps and does not participate in shadowing, so
+        // app4 also has access to applet4.
+        rule(
+            match_carrier(app4),
+            tlv::Object::new(
+                tlv::Tag::ArDo,
+                tlv::Value::Constructed(vec![tlv::Object::new(
+                    tlv::Tag::PermArDo,
+                    tlv::Value::Primitive(&[0, 0, 0, 1, 0, 0, 0, 0 /* Always allow */]),
+                )]),
+            ),
+        ),
+    ]);
+
+    let rules = RuleSet::new(
+        build_rules_from_ara_m_tlv(ara_m_rule_set)?
+            .into_iter()
+            .chain(build_rules_from_ara_d_tlv(ara_d_rule_set)?.into_iter()),
+    );
 
     trace!("Zen RuleSet: {rules:#?}");
 
@@ -648,9 +689,10 @@ fn test_zen_rule_set() -> Result<()> {
     assert!(rules.check_nfc(test_app, applet0));
     assert_eq!(*rules.get_apdu_rule(test_app, applet1), ApduAccessRule::Never);
     assert!(rules.check_nfc(test_app, applet1));
-    assert!(rules.check_apdu(test_app, applet2, &[0x00, 0xA0, 0x01, 0x05].into()));
-    assert!(rules.check_apdu(test_app, applet2, &[0x0F, 0xA0, 0x02, 0x09].into()));
-    assert!(!rules.check_apdu(test_app, applet2, &[0x00, 0xA1, 0x01, 0x05].into()));
+    let apdu_rule = rules.get_apdu_rule(test_app, applet2);
+    assert!(apdu_rule.allow_apdu(&[0x00, 0xA0, 0x01, 0x05].into()));
+    assert!(apdu_rule.allow_apdu(&[0x0F, 0xA0, 0x02, 0x09].into()));
+    assert!(!apdu_rule.allow_apdu(&[0x00, 0xA1, 0x01, 0x05].into()));
     assert!(!rules.check_nfc(test_app, applet2));
     assert_eq!(*rules.get_apdu_rule(test_app, applet3), ApduAccessRule::Never);
     assert!(!rules.check_nfc(test_app, applet3));
@@ -734,7 +776,7 @@ fn test_zen_rule_set() -> Result<()> {
     Ok(())
 }
 
-#[test]
+#[gtest]
 fn test_highest_sha256_masks_sha1() -> Result<()> {
     init();
 
@@ -742,7 +784,7 @@ fn test_highest_sha256_masks_sha1() -> Result<()> {
     check_sha_256_masks_sha1(applet.clone(), match_aid(&applet))
 }
 
-#[test]
+#[gtest]
 fn test_wildcard_aid_sha256_masks_sha1() -> Result<()> {
     init();
 
@@ -772,7 +814,8 @@ fn check_sha_256_masks_sha1(
     );
 
     // With only the sha1 rule, we should get filter0 & NFC allowed
-    let rules = RuleCache::from_tlv(rule_set(vec![sha1_rule_w_filter_0.clone()]))?;
+    let rules =
+        RuleSet::new(build_rules_from_ara_m_tlv(rule_set(vec![sha1_rule_w_filter_0.clone()]))?);
     assert_eq!(
         *rules.get_apdu_rule(&app, &applet),
         ApduAccessRule::PartialAllow(ApduFilterSet::from_data(&filter0)?)
@@ -780,7 +823,8 @@ fn check_sha_256_masks_sha1(
     assert!(rules.check_nfc(&app, &applet),);
 
     // With only the sha256 rule, we should get filter1 & NFC denied
-    let rules = RuleCache::from_tlv(rule_set(vec![sha256_rule_w_filter_1.clone()]))?;
+    let rules =
+        RuleSet::new(build_rules_from_ara_m_tlv(rule_set(vec![sha256_rule_w_filter_1.clone()]))?);
     assert_eq!(
         *rules.get_apdu_rule(&app, &applet),
         ApduAccessRule::PartialAllow(ApduFilterSet::from_data(&filter1)?)
@@ -788,10 +832,10 @@ fn check_sha_256_masks_sha1(
     assert!(!rules.check_nfc(&app, &applet),);
 
     // With both sha1 and sha256 rules, we should again get the sha256 rule content.
-    let rules = RuleCache::from_tlv(rule_set(vec![
+    let rules = RuleSet::new(build_rules_from_ara_m_tlv(rule_set(vec![
         sha256_rule_w_filter_1.clone(),
         sha1_rule_w_filter_0.clone(),
-    ]))?;
+    ]))?);
     assert_eq!(
         *rules.get_apdu_rule(&app, &applet),
         ApduAccessRule::PartialAllow(ApduFilterSet::from_data(&filter1)?)
@@ -799,10 +843,10 @@ fn check_sha_256_masks_sha1(
     assert!(!rules.check_nfc(&app, &applet),);
 
     // Rule order shouldn't matter
-    let rules = RuleCache::from_tlv(rule_set(vec![
+    let rules = RuleSet::new(build_rules_from_ara_m_tlv(rule_set(vec![
         sha1_rule_w_filter_0.clone(),
         sha256_rule_w_filter_1.clone(),
-    ]))?;
+    ]))?);
     assert_eq!(
         *rules.get_apdu_rule(&app, &applet),
         ApduAccessRule::PartialAllow(ApduFilterSet::from_data(&filter1)?)
@@ -812,7 +856,7 @@ fn check_sha_256_masks_sha1(
     Ok(())
 }
 
-#[test]
+#[gtest]
 fn test_low_rules_mask_least_rules() -> Result<()> {
     init();
 
@@ -838,7 +882,7 @@ fn test_low_rules_mask_least_rules() -> Result<()> {
     let applet = AppletId::Aid(&[0; 5]);
 
     // With only the low rule, we should get filter0 for app1 and NEVER for app2.
-    let rules = RuleCache::from_tlv(rule_set(vec![low_rule.clone()]))?;
+    let rules = RuleSet::new(build_rules_from_ara_m_tlv(rule_set(vec![low_rule.clone()]))?);
     assert_eq!(
         *rules.get_apdu_rule(&app1, &applet),
         ApduAccessRule::PartialAllow(ApduFilterSet::from_data(&filter0)?)
@@ -846,7 +890,7 @@ fn test_low_rules_mask_least_rules() -> Result<()> {
     assert_eq!(*rules.get_apdu_rule(&app2, &applet), ApduAccessRule::Never,);
 
     // With only the least rule, we should get filter1 for both apps.
-    let rules = RuleCache::from_tlv(rule_set(vec![least_rule.clone()]))?;
+    let rules = RuleSet::new(build_rules_from_ara_m_tlv(rule_set(vec![least_rule.clone()]))?);
     assert_eq!(
         *rules.get_apdu_rule(&app1, &applet),
         ApduAccessRule::PartialAllow(ApduFilterSet::from_data(&filter1)?)
@@ -859,7 +903,10 @@ fn test_low_rules_mask_least_rules() -> Result<()> {
     // With both rules, we should get filter1 for app1, but NEVER for app2, because the low
     // rule masks the least rule, making it inapplicable.
     // With only the least rule, we should get filter1 for both apps.
-    let rules = RuleCache::from_tlv(rule_set(vec![least_rule.clone(), low_rule.clone()]))?;
+    let rules = RuleSet::new(build_rules_from_ara_m_tlv(rule_set(vec![
+        least_rule.clone(),
+        low_rule.clone(),
+    ]))?);
     assert_eq!(
         *rules.get_apdu_rule(&app1, &applet),
         ApduAccessRule::PartialAllow(ApduFilterSet::from_data(&filter0)?)
@@ -867,7 +914,10 @@ fn test_low_rules_mask_least_rules() -> Result<()> {
     assert_eq!(*rules.get_apdu_rule(&app2, &applet), ApduAccessRule::Never);
 
     // Rule order doesn't matter.
-    let rules = RuleCache::from_tlv(rule_set(vec![low_rule.clone(), least_rule.clone()]))?;
+    let rules = RuleSet::new(build_rules_from_ara_m_tlv(rule_set(vec![
+        low_rule.clone(),
+        least_rule.clone(),
+    ]))?);
     assert_eq!(
         *rules.get_apdu_rule(&app1, &applet),
         ApduAccessRule::PartialAllow(ApduFilterSet::from_data(&filter0)?)
@@ -883,7 +933,7 @@ fn test_invalid_rule_set() -> Result<()> {
 
     // Wrong tag
     assert_that!(
-        RuleCache::from_tlv(Object::new(Tag::ArDo, Value::Empty))
+        build_rules_from_ara_m_tlv(Object::new(Tag::ArDo, Value::Empty))
             .unwrap_err()
             .root_cause()
             .to_string(),
@@ -892,11 +942,12 @@ fn test_invalid_rule_set() -> Result<()> {
 
     // Wrong content type
     assert_that!(
-        RuleCache::from_tlv(Object::new(Tag::ResponseAllRefArDo, Value::Primitive(&[])))
+        build_rules_from_ara_m_tlv(Object::new(Tag::ResponseAllRefArDo, Value::Primitive(&[])),)
             .unwrap_err()
             .root_cause()
-            .to_string(),
-        contains_substring("Invalid RuleCache content Primitive")
+            .to_string()
+            .as_str(),
+        contains_substring("Invalid content Primitive")
     );
 
     Ok(())
@@ -908,17 +959,23 @@ fn test_invalid_rule() -> Result<()> {
 
     // Wrong content type
     expect_that!(
-        Rule::from_tlv(Object::new(Tag::RefArDo, Value::Empty)).unwrap_err().to_string(),
+        Rule::from_ara_m_tlv((0, Object::new(Tag::RefArDo, Value::Empty)))
+            .unwrap_err()
+            .root_cause()
+            .to_string(),
         contains_substring("Invalid RefArDo content Empty")
     );
     expect_that!(
-        Rule::from_tlv(Object::new(Tag::RefArDo, Value::Primitive(&[]))).unwrap_err().to_string(),
+        Rule::from_ara_m_tlv((0, Object::new(Tag::RefArDo, Value::Primitive(&[]))))
+            .unwrap_err()
+            .root_cause()
+            .to_string(),
         contains_substring("Invalid RefArDo content Primitive")
     );
 
     // Missing match criteria
     expect_that!(
-        Rule::from_tlv(Object::new(Tag::RefArDo, Value::Constructed(vec![])))
+        Rule::from_ara_m_tlv((0, Object::new(Tag::RefArDo, Value::Constructed(vec![]))))
             .unwrap_err()
             .root_cause()
             .to_string(),
@@ -927,9 +984,12 @@ fn test_invalid_rule() -> Result<()> {
 
     // Missing access rules
     expect_that!(
-        Rule::from_tlv(Object::new(
-            Tag::RefArDo,
-            Value::Constructed(vec![matcher(match_any_aid(), match_any_app())])
+        Rule::from_ara_m_tlv((
+            0,
+            Object::new(
+                Tag::RefArDo,
+                Value::Constructed(vec![matcher(match_any_aid(), match_any_app())])
+            ),
         ))
         .unwrap_err()
         .root_cause()
@@ -939,28 +999,34 @@ fn test_invalid_rule() -> Result<()> {
 
     // Extra entry
     expect_that!(
-        Rule::from_tlv(Object::new(
-            Tag::RefArDo,
-            Value::Constructed(vec![
-                matcher(match_any_aid(), match_any_app()),
-                access_rule(apdu_access_always(), nfc_access_always()),
-                access_rule(apdu_access_always(), nfc_access_always()),
-            ])
+        Rule::from_ara_m_tlv((
+            0,
+            Object::new(
+                Tag::RefArDo,
+                Value::Constructed(vec![
+                    matcher(match_any_aid(), match_any_app()),
+                    access_rule(apdu_access_always(), nfc_access_always()),
+                    access_rule(apdu_access_always(), nfc_access_always()),
+                ])
+            ),
         ))
         .unwrap_err()
         .root_cause()
         .to_string(),
-        contains_substring("Found multiple")
+        contains_substring("Extra entry")
     );
 
     // Unknown tag
-    let contains_unknown = Rule::from_tlv(Object::new(
-        Tag::RefArDo,
-        Value::Constructed(vec![
-            matcher(match_any_aid(), match_any_app()),
-            Object::new(Tag::new(&[0x00]), Value::Empty),
-            access_rule(apdu_access_always(), nfc_access_always()),
-        ]),
+    let contains_unknown = Rule::from_ara_m_tlv((
+        0,
+        Object::new(
+            Tag::RefArDo,
+            Value::Constructed(vec![
+                matcher(match_any_aid(), match_any_app()),
+                Object::new(Tag::new(&[0x00]), Value::Empty),
+                access_rule(apdu_access_always(), nfc_access_always()),
+            ]),
+        ),
     ));
 
     if cfg!(feature = "disallow_unknown_ara_tags") {
@@ -984,18 +1050,18 @@ fn test_gp_doc_test_case_1() -> Result<()> {
     let applet2 = &AppletId::Aid(&[2]);
     let app1 = &DeviceAppId::new_apk(vec![[1; 32].into()], vec![], vec![]);
 
-    let rules = RuleCache::from_tlv(rule_set(vec![rule(
+    let rules = RuleSet::new(build_rules_from_ara_m_tlv(rule_set(vec![rule(
         matcher(match_aid(applet1), match_app_sha256(app1)),
         access_rule(apdu_access_always(), no_rule()),
-    )]))?;
+    )]))?);
     trace!("{rules:?}");
 
     assert_eq!(*rules.get_apdu_rule(app1, applet1), ApduAccessRule::Always);
     assert_eq!(*rules.get_apdu_rule(app1, applet2), ApduAccessRule::Never);
     // Doc doesn't say what NFC access should be.
 
-    assert!(rules.check_apdu(app1, applet1, &[0; 4].into()));
-    assert!(!rules.check_apdu(app1, applet2, &[0; 4].into()));
+    assert!(rules.get_apdu_rule(app1, applet1).allow_apdu(&[0; 4].into()));
+    assert!(!rules.get_apdu_rule(app1, applet2).allow_apdu(&[0; 4].into()));
 
     Ok(())
 }
@@ -1010,7 +1076,7 @@ fn test_gp_doc_test_case_2() -> Result<()> {
     let app1 = &DeviceAppId::new_apk(vec![[1; 32].into()], vec![], vec![]);
     let app2 = &DeviceAppId::new_apk(vec![[2; 32].into()], vec![], vec![]);
 
-    let rules = RuleCache::from_tlv(rule_set(vec![
+    let rules = RuleSet::new(build_rules_from_ara_m_tlv(rule_set(vec![
         rule(
             matcher(match_aid(applet1), match_app_sha256(app1)),
             access_rule(apdu_access_always(), no_rule()),
@@ -1019,7 +1085,7 @@ fn test_gp_doc_test_case_2() -> Result<()> {
             matcher(match_aid(applet1), match_app_sha256(app2)),
             access_rule(apdu_access_always(), no_rule()),
         ),
-    ]))?;
+    ]))?);
     trace!("{rules:?}");
 
     assert_eq!(*rules.get_apdu_rule(app1, applet1), ApduAccessRule::Always);
@@ -1040,10 +1106,10 @@ fn test_gp_doc_test_case_3() -> Result<()> {
     let app1 = &DeviceAppId::new_apk(vec![[1; 32].into()], vec![], vec![]);
     let app2 = &DeviceAppId::new_apk(vec![[2; 32].into()], vec![], vec![]);
 
-    let rules = RuleCache::from_tlv(rule_set(vec![rule(
+    let rules = RuleSet::new(build_rules_from_ara_m_tlv(rule_set(vec![rule(
         matcher(match_aid(applet1), match_app_sha256(app1)),
         access_rule(apdu_access_never(), no_rule()),
-    )]))?;
+    )]))?);
     trace!("{rules:?}");
 
     assert_eq!(*rules.get_apdu_rule(app1, applet1), ApduAccessRule::Never);
@@ -1064,7 +1130,7 @@ fn test_gp_doc_test_case_4() -> Result<()> {
     let app1 = &DeviceAppId::new_apk(vec![[1; 32].into()], vec![], vec![]);
     let app2 = &DeviceAppId::new_apk(vec![[2; 32].into()], vec![], vec![]);
 
-    let rules = RuleCache::from_tlv(rule_set(vec![
+    let rules = RuleSet::new(build_rules_from_ara_m_tlv(rule_set(vec![
         rule(
             matcher(match_aid(applet1), match_app_sha256(app1)),
             access_rule(apdu_access_always(), no_rule()),
@@ -1073,7 +1139,7 @@ fn test_gp_doc_test_case_4() -> Result<()> {
             matcher(match_aid(applet1), match_app_sha256(app1)),
             access_rule(apdu_access_never(), no_rule()),
         ),
-    ]))?;
+    ]))?);
     trace!("{rules:?}");
 
     assert_eq!(*rules.get_apdu_rule(app1, applet1), ApduAccessRule::Never);
@@ -1094,10 +1160,10 @@ fn test_gp_doc_test_case_5() -> Result<()> {
     let app1 = &DeviceAppId::new_apk(vec![[1; 32].into()], vec![], vec![]);
     let app2 = &DeviceAppId::new_apk(vec![[2; 32].into()], vec![], vec![]);
 
-    let rules = RuleCache::from_tlv(rule_set(vec![rule(
+    let rules = RuleSet::new(build_rules_from_ara_m_tlv(rule_set(vec![rule(
         matcher(match_aid(applet1), match_app_sha256(app1)),
         access_rule(apdu_access_filtered(&[1; 8]), no_rule()),
-    )]))?;
+    )]))?);
     trace!("{rules:?}");
 
     assert_eq!(
@@ -1122,7 +1188,7 @@ fn test_gp_doc_test_case_6() -> Result<()> {
     let app1 = &DeviceAppId::new_apk(vec![[1; 32].into()], vec![], vec![]);
     let app2 = &DeviceAppId::new_apk(vec![[2; 32].into()], vec![], vec![]);
 
-    let rules = RuleCache::from_tlv(rule_set(vec![
+    let rules = RuleSet::new(build_rules_from_ara_m_tlv(rule_set(vec![
         rule(
             matcher(match_aid(applet1), match_app_sha256(app2)),
             access_rule(apdu_access_never(), no_rule()),
@@ -1135,7 +1201,7 @@ fn test_gp_doc_test_case_6() -> Result<()> {
             matcher(match_any_aid(), match_app_sha256(app2)),
             access_rule(apdu_access_always(), no_rule()),
         ),
-    ]))?;
+    ]))?);
     trace!("{rules:#?}");
 
     assert_eq!(*rules.get_apdu_rule(app1, applet1), ApduAccessRule::Never);
@@ -1161,7 +1227,7 @@ fn test_gp_doc_test_case_7() -> Result<()> {
     let app1 = &DeviceAppId::new_apk(vec![[1; 32].into()], vec![], vec![]);
     let app2 = &DeviceAppId::new_apk(vec![[2; 32].into()], vec![], vec![]);
 
-    let rules = RuleCache::from_tlv(rule_set(vec![
+    let rules = RuleSet::new(build_rules_from_ara_m_tlv(rule_set(vec![
         rule(
             matcher(match_aid(applet1), match_app_sha256(app1)),
             access_rule(apdu_access_never(), no_rule()),
@@ -1170,7 +1236,7 @@ fn test_gp_doc_test_case_7() -> Result<()> {
             matcher(match_aid(applet1), match_app_sha256(app2)),
             access_rule(apdu_access_filtered(&[1; 8]), no_rule()),
         ),
-    ]))?;
+    ]))?);
     trace!("{rules:?}");
 
     assert_eq!(*rules.get_apdu_rule(app1, applet1), ApduAccessRule::Never);
@@ -1194,7 +1260,7 @@ fn test_gp_doc_test_case_9() -> Result<()> {
     let app1 = &DeviceAppId::new_apk(vec![[1; 32].into()], vec![], vec![]);
     let app2 = &DeviceAppId::new_apk(vec![[2; 32].into()], vec![], vec![]);
 
-    let rules = RuleCache::from_tlv(rule_set(vec![
+    let rules = RuleSet::new(build_rules_from_ara_m_tlv(rule_set(vec![
         rule(
             matcher(match_aid(applet1), match_app_sha256(app1)),
             access_rule(apdu_access_always(), no_rule()),
@@ -1203,7 +1269,7 @@ fn test_gp_doc_test_case_9() -> Result<()> {
             matcher(match_aid(applet1), match_any_app()),
             access_rule(apdu_access_never(), no_rule()),
         ),
-    ]))?;
+    ]))?);
     trace!("{rules:?}");
 
     assert_eq!(*rules.get_apdu_rule(app1, applet1), ApduAccessRule::Always);
@@ -1224,7 +1290,7 @@ fn test_gp_doc_test_case_10() -> Result<()> {
     let app1 = &DeviceAppId::new_apk(vec![[1; 32].into()], vec![], vec![]);
     let app2 = &DeviceAppId::new_apk(vec![[2; 32].into()], vec![], vec![]);
 
-    let rules = RuleCache::from_tlv(rule_set(vec![
+    let rules = RuleSet::new(build_rules_from_ara_m_tlv(rule_set(vec![
         rule(
             matcher(match_aid(applet1), match_app_sha256(app1)),
             access_rule(apdu_access_never(), no_rule()),
@@ -1233,7 +1299,7 @@ fn test_gp_doc_test_case_10() -> Result<()> {
             matcher(match_aid(applet1), match_any_app()),
             access_rule(apdu_access_always(), no_rule()),
         ),
-    ]))?;
+    ]))?);
     trace!("{rules:?}");
 
     assert_eq!(*rules.get_apdu_rule(app1, applet1), ApduAccessRule::Never);
@@ -1254,7 +1320,7 @@ fn test_gp_doc_test_case_11() -> Result<()> {
     let app1 = &DeviceAppId::new_apk(vec![[1; 32].into()], vec![], vec![]);
     let app2 = &DeviceAppId::new_apk(vec![[2; 32].into()], vec![], vec![]);
 
-    let rules = RuleCache::from_tlv(rule_set(vec![
+    let rules = RuleSet::new(build_rules_from_ara_m_tlv(rule_set(vec![
         rule(
             matcher(match_aid(applet1), match_app_sha256(app1)),
             access_rule(apdu_access_never(), no_rule()),
@@ -1263,7 +1329,7 @@ fn test_gp_doc_test_case_11() -> Result<()> {
             matcher(match_aid(applet1), match_any_app()),
             access_rule(apdu_access_never(), no_rule()),
         ),
-    ]))?;
+    ]))?);
     trace!("{rules:?}");
 
     assert_eq!(*rules.get_apdu_rule(app1, applet1), ApduAccessRule::Never);
@@ -1284,7 +1350,7 @@ fn test_gp_doc_test_case_12() -> Result<()> {
     let app1 = &DeviceAppId::new_apk(vec![[1; 32].into()], vec![], vec![]);
     let app2 = &DeviceAppId::new_apk(vec![[2; 32].into()], vec![], vec![]);
 
-    let rules = RuleCache::from_tlv(rule_set(vec![
+    let rules = RuleSet::new(build_rules_from_ara_m_tlv(rule_set(vec![
         rule(
             matcher(match_aid(applet1), match_app_sha256(app1)),
             access_rule(apdu_access_always(), no_rule()),
@@ -1293,7 +1359,7 @@ fn test_gp_doc_test_case_12() -> Result<()> {
             matcher(match_aid(applet1), match_any_app()),
             access_rule(apdu_access_always(), no_rule()),
         ),
-    ]))?;
+    ]))?);
     trace!("{rules:?}");
 
     assert_eq!(*rules.get_apdu_rule(app1, applet1), ApduAccessRule::Always);
@@ -1314,10 +1380,10 @@ fn test_gp_doc_test_case_13() -> Result<()> {
     let app1 = &DeviceAppId::new_apk(vec![[1; 32].into()], vec![], vec![]);
     let app2 = &DeviceAppId::new_apk(vec![[2; 32].into()], vec![], vec![]);
 
-    let rules = RuleCache::from_tlv(rule_set(vec![rule(
+    let rules = RuleSet::new(build_rules_from_ara_m_tlv(rule_set(vec![rule(
         matcher(match_any_aid(), match_any_app()),
         access_rule(apdu_access_always(), no_rule()),
-    )]))?;
+    )]))?);
     trace!("{rules:?}");
 
     assert_eq!(*rules.get_apdu_rule(app1, applet1), ApduAccessRule::Always);
@@ -1338,7 +1404,7 @@ fn test_gp_doc_test_case_14() -> Result<()> {
     let app1 = &DeviceAppId::new_apk(vec![[1; 32].into()], vec![], vec![]);
     let app2 = &DeviceAppId::new_apk(vec![[2; 32].into()], vec![], vec![]);
 
-    let rules = RuleCache::from_tlv(rule_set(vec![
+    let rules = RuleSet::new(build_rules_from_ara_m_tlv(rule_set(vec![
         rule(
             matcher(match_aid(applet1), match_app_sha256(app1)),
             access_rule(apdu_access_never(), no_rule()),
@@ -1347,7 +1413,7 @@ fn test_gp_doc_test_case_14() -> Result<()> {
             matcher(match_aid(applet1), match_any_app()),
             access_rule(apdu_access_always(), no_rule()),
         ),
-    ]))?;
+    ]))?);
     trace!("{rules:?}");
 
     assert_eq!(*rules.get_apdu_rule(app1, applet1), ApduAccessRule::Never);
@@ -1369,7 +1435,7 @@ fn test_gp_doc_test_case_15() -> Result<()> {
     let app1 = &DeviceAppId::new_apk(vec![[1; 32].into()], vec![], vec![]);
     let app2 = &DeviceAppId::new_apk(vec![[2; 32].into()], vec![], vec![]);
 
-    let rules = RuleCache::from_tlv(rule_set(vec![
+    let rules = RuleSet::new(build_rules_from_ara_m_tlv(rule_set(vec![
         rule(
             matcher(match_aid(applet1), match_any_app()),
             access_rule(apdu_access_always(), no_rule()),
@@ -1382,7 +1448,7 @@ fn test_gp_doc_test_case_15() -> Result<()> {
             matcher(match_any_aid(), match_any_app()),
             access_rule(apdu_access_never(), no_rule()),
         ),
-    ]))?;
+    ]))?);
     trace!("{rules:?}");
 
     assert_eq!(*rules.get_apdu_rule(app1, applet1), ApduAccessRule::Always);
@@ -1406,7 +1472,7 @@ fn test_gp_doc_test_case_16() -> Result<()> {
     let app1 = &DeviceAppId::new_apk(vec![[1; 32].into()], vec![], vec![]);
     let app2 = &DeviceAppId::new_apk(vec![[2; 32].into()], vec![], vec![]);
 
-    let rules = RuleCache::from_tlv(rule_set(vec![
+    let rules = RuleSet::new(build_rules_from_ara_m_tlv(rule_set(vec![
         rule(
             matcher(match_aid(applet1), match_app_sha256(app1)),
             access_rule(apdu_access_never(), no_rule()),
@@ -1431,7 +1497,7 @@ fn test_gp_doc_test_case_16() -> Result<()> {
             matcher(match_any_aid(), match_any_app()),
             access_rule(apdu_access_always(), no_rule()),
         ),
-    ]))?;
+    ]))?);
     trace!("{rules:?}");
 
     assert_eq!(*rules.get_apdu_rule(app1, applet1), ApduAccessRule::Never);
@@ -1457,7 +1523,7 @@ fn test_gp_doc_test_case_17() -> Result<()> {
     let app3 = &DeviceAppId::new_apk(vec![[3; 32].into()], vec![], vec![]);
     let app4 = &DeviceAppId::new_apk(vec![[4; 32].into()], vec![], vec![]);
 
-    let rules = RuleCache::from_tlv(rule_set(vec![
+    let rules = RuleSet::new(build_rules_from_ara_m_tlv(rule_set(vec![
         rule(
             matcher(match_aid(applet1), match_app_sha256(app1)),
             access_rule(apdu_access_never(), no_rule()),
@@ -1506,7 +1572,7 @@ fn test_gp_doc_test_case_17() -> Result<()> {
             matcher(match_any_aid(), match_any_app()),
             access_rule(apdu_access_never(), no_rule()),
         ),
-    ]))?;
+    ]))?);
     trace!("{rules:?}");
 
     assert_eq!(*rules.get_apdu_rule(app1, applet1), ApduAccessRule::Never);
@@ -1594,7 +1660,8 @@ fn text_xml_rules() -> Result<()> {
         ),
     ];
 
-    let tlv_rules = tlv.into_iter().map(Rule::from_tlv).collect::<Result<Vec<_>>>()?;
+    let tlv_rules =
+        tlv.into_iter().enumerate().map(Rule::from_ara_m_tlv).collect::<Result<Vec<_>>>()?;
 
     assert_that!(xml_rules, eq(&tlv_rules));
 

@@ -220,6 +220,7 @@ pub enum Tag {
     PkgRefDo,
     ResponseRefreshTagDo,
     ResponseAllRefArDo,
+    PermArDo,
     Unknown(Vec<u8>),
 }
 
@@ -232,6 +233,7 @@ impl Tag {
             [0xCA] => Self::PkgRefDo,
             [0xD0] => Self::ApduArDo,
             [0xD1] => Self::NfcArDo,
+            [0xD8] => Self::PermArDo,
             [0xE1] => Self::RefDo,
             [0xE2] => Self::RefArDo,
             [0xE3] => Self::ArDo,
@@ -253,6 +255,7 @@ impl Tag {
             Tag::RefArDo => &[0xE2],
             Tag::RefDo => &[0xE1],
             Tag::ResponseRefreshTagDo => &[0xDF, 0x20],
+            Tag::PermArDo => &[0xD8],
             Tag::ResponseAllRefArDo => &[0xFF, 0x40],
             Tag::Unknown(vec) => vec,
         }

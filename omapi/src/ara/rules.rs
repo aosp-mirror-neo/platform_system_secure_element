@@ -29,11 +29,11 @@
 use super::{tlv, xml};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use itertools::{izip, Itertools};
-use log::{info, trace};
+use log::{trace, warn};
 use std::{
     array::TryFromSliceError,
     cmp::Ordering,
-    collections::{btree_map::Entry, BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet},
 };
 
 #[cfg(test)]
@@ -46,6 +46,36 @@ pub const APDU_HEADER_LEN: usize = 4;
 /// mask that is bitwise ANDed with the header and the other is a pattern that is compared with
 /// the mask result.
 pub const APDU_FILTER_SET_LEN: usize = 2 * APDU_HEADER_LEN;
+
+/// Trait for types that can be converted from a tlv::Object.
+trait ConvertibleFromTlv: Sized {
+    /// Convert the [`tlv::Object`] to `Self`, or return an error if the object structure is
+    /// incorrect.
+    fn from_tlv(tlv: tlv::Object) -> Result<Self>;
+}
+
+/// Trait for types that can be converted from a vector of tlv::Objects.  The objects in the
+/// vector get mapped to fields in the resulting type.
+trait ConvertibleFromTlvVec: Sized {
+    /// Return the tag of the parent [`tlv::Object`] in which the vector is found.
+    fn parent_tag() -> tlv::Tag;
+
+    /// Convert the vector of [`tlv::Objects`] to field values and assemble them, or return an
+    /// error if some part of the structure is incorrect.
+    fn from_tlv_vec(vec: Vec<tlv::Object>) -> Result<Self>;
+}
+
+/// All types that are convertible from a TLV vector are first converted from a single TLV object
+/// that contains that vector.  We implement this step generically.
+impl<T: ConvertibleFromTlvVec> ConvertibleFromTlv for T {
+    fn from_tlv(tlv: tlv::Object) -> Result<Self> {
+        ensure!(*tlv.tag() == T::parent_tag());
+        match tlv.get_content() {
+            tlv::Value::Constructed(vec) => T::from_tlv_vec(vec),
+            other => bail!("Invalid content {other} for {}", T::parent_tag()),
+        }
+    }
+}
 
 /// SHA-256 digest of an application certificate
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -148,13 +178,10 @@ impl<'a> AppletId<'a> {
 }
 
 /// ARA rules are ranked by specificity, and are evaluated strictly in the order defined by this
-/// enum, "Carrier" first.  The reason for the naming is that "Least" to "Highest" are the
-/// priorities defined in the first ARA-M document, and "Carrier" represents the even higher,
-/// carrier-only priority level defined by ARA-D.
+/// enum.  The reason for the naming is that "Least" to "Highest" are the
+/// priorities defined by the ARA-M specification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum RuleSpecificity {
-    /// Specifies device app & package name
-    Carrier,
     /// Specifies AID and device app
     Highest,
     /// Specifies AID, matches any device app
@@ -169,15 +196,15 @@ enum RuleSpecificity {
 ///
 /// Corresponds to Response-ALL-REF-DO.  See ARA-M page 35.
 #[derive(Debug, Clone)]
-pub struct RuleCache {
+pub struct RuleSet {
     /// ARA rules to be applied.  Will be checked in the order they're found in the vector, which
-    /// means they must be ordered correctly when the [`RuleCache`] is created.
+    /// means they must be ordered correctly when the [`RuleSet`] is created.
     rules: Vec<Rule>,
 }
 
-impl RuleCache {
-    /// This method constructs a [`RuleCache`] from an iterator over [`Rule`]s, but it does some
-    /// extra work to implement meta-rules that would be applied at evaluation time, i.e.  when
+impl RuleSet {
+    /// This method constructs a [`RuleSet`] from an iterator over [`Rule`]s, but it does some
+    /// extra work to implement ARA-M meta-rules that would be applied at evaluation time, i.e.  when
     /// trying to compute access for an AID and app.  By doing some extra work now we can
     /// pre-compute the result of the meta-rules so the work doesn't have to be done during
     /// evaluation. We do the following:
@@ -203,35 +230,44 @@ impl RuleCache {
     ///
     /// 4.  Priority hierarchy.  Rules must be applied in strict priority order (based on
     ///     specificity/genericity).  We handle this by sorting the rules by
-    ///     [`MatchCriteria::cmp`], which is defined to produce the correct order.  Sorting is
+    ///     [`AraMMatchCriteria::cmp`], which is defined to produce the correct order.  Sorting is
     ///     provided by the [`BTreeMap`].
     ///
     /// By applying these optimizations now, we don't have to bother with these meta-rules at
     /// evaluation time.  We can just apply the rules sequentially, taking the first match.
+    ///
+    /// For ARA-D rules there is no pre-processing to be done, but the ARA-D rules are higher in
+    /// priority than ARA-M rules, and so must come first in the final map.
     pub fn new<I>(rules_iter: I) -> Self
     where
         I: IntoIterator<Item = Rule>,
     {
-        let mut rules = construct_merged_rule_map(rules_iter);
-        handle_aid_shadowing_rule(&mut rules);
-        handle_app_shadowing(&mut rules);
-        RuleCache { rules: rules.into_iter().map(Rule::from_tuple).collect() }
-    }
+        let mut ara_m_rules: BTreeMap<AraMMatchCriteria, AraMAccessRules> = BTreeMap::new();
+        let mut ara_d_rules: Vec<Rule> = Vec::new();
 
-    /// Convert parsed-TLV object containing rules to a [`Vec<Rule>`], preparatory to creating a
-    /// [`RuleCache`] (perhaps containing rules from multiple sources).
-    pub fn tlv_to_rules(tlv: tlv::Object) -> Result<Vec<Rule>> {
-        ensure!(*tlv.tag() == tlv::Tag::ResponseAllRefArDo);
-        let value = tlv.get_content();
-        match value {
-            tlv::Value::Empty => Ok(Vec::new()),
-            tlv::Value::Constructed(vec) => {
-                vec.into_iter().filter(is_known_tag).map(Rule::from_tlv).collect()
-            }
-            tlv::Value::Primitive(_) => {
-                bail!("Invalid RuleCache content {}", value)
+        for rule in rules_iter {
+            match rule {
+                Rule::AraM { criteria, access } => {
+                    ara_m_rules
+                        .entry(criteria)
+                        .and_modify(|entry| {
+                            entry.merge(&access);
+                        })
+                        .or_insert(access);
+                }
+                Rule::AraD { .. } => {
+                    ara_d_rules.push(rule);
+                }
             }
         }
+
+        handle_aid_shadowing_rule(&mut ara_m_rules);
+        handle_app_shadowing(&mut ara_m_rules);
+
+        let mut rules = ara_d_rules;
+        rules.extend(ara_m_rules.into_iter().map(Rule::from_ara_m_tuple));
+
+        RuleSet { rules }
     }
 
     /// Returns the APDU access restrictions for the specified device app and AID.  To check the
@@ -251,46 +287,18 @@ impl RuleCache {
 
     /// Returns the access rules, both APDU and NFC, for the specified device app and AID.  To
     /// check the default-selected applet specify [`AppletId::DefaultApplet`] for `applet`.
-    fn get_rules(&self, app: &DeviceAppId, aid: &AppletId) -> &AccessRules {
+    fn get_rules(&self, app: &DeviceAppId, aid: &AppletId) -> &AraMAccessRules {
         self.rules
             .iter()
-            .find_map(|rule| rule.criteria.matches(app, aid).then_some(&rule.access))
-            .unwrap_or(&AccessRules::NEVER)
+            .find_map(|rule| rule.matches(app, aid).then_some(rule.access()))
+            .unwrap_or(&AraMAccessRules::NEVER)
     }
-
-    #[cfg(test)]
-    fn from_tlv(tlv: tlv::Object) -> Result<Self> {
-        Ok(Self::new(Self::tlv_to_rules(tlv)?))
-    }
-
-    #[cfg(test)]
-    fn check_apdu(&self, app: &DeviceAppId, aid: &AppletId, apdu_header: &ApduHeader) -> bool {
-        self.get_apdu_rule(app, aid).allow_apdu(apdu_header)
-    }
-}
-
-/// Merge rules from an iterator into a map.  "Merge" means that where two [`Rule`]s have the same
-/// [`MatchCriteria`], their [`AccessRules`]s are merged.
-fn construct_merged_rule_map<I>(rules: I) -> BTreeMap<MatchCriteria, AccessRules>
-where
-    I: IntoIterator<Item = Rule>,
-{
-    let mut map = BTreeMap::new();
-    for rule in rules {
-        match map.entry(rule.criteria) {
-            Entry::Vacant(entry) => {
-                entry.insert(rule.access);
-            }
-            Entry::Occupied(mut entry) => entry.get_mut().merge(rule.access),
-        }
-    }
-    map
 }
 
 /// Handle AID shadowing by setting [`AccessRules::NEVER`] for any app-wildcard rule (i.e.
 /// [`RuleSpecificity::High`]) with an AID that is mentioned in a fully-specified (i.e.
 /// [`RuleSpecificity::Highest`] rule.
-fn handle_aid_shadowing_rule(rules: &mut BTreeMap<MatchCriteria, AccessRules>) {
+fn handle_aid_shadowing_rule(rules: &mut BTreeMap<AraMMatchCriteria, AraMAccessRules>) {
     let mut shadowing_aids = BTreeSet::new();
     for (criteria, _) in rules.iter() {
         if criteria.specificity() == RuleSpecificity::Highest {
@@ -302,7 +310,7 @@ fn handle_aid_shadowing_rule(rules: &mut BTreeMap<MatchCriteria, AccessRules>) {
         if criteria.specificity() == RuleSpecificity::High
             && shadowing_aids.contains(&criteria.aid_ref)
         {
-            *access = AccessRules::NEVER;
+            *access = AraMAccessRules::NEVER;
         }
     }
 }
@@ -312,10 +320,22 @@ fn handle_aid_shadowing_rule(rules: &mut BTreeMap<MatchCriteria, AccessRules>) {
 ///
 /// We search in reverse order because [`Iterator::any`] short-circuits and
 /// [`RuleSpecificity::Low`] rules are towards the end of the rule set. Minor efficiency tweak.
-fn handle_app_shadowing(rules: &mut BTreeMap<MatchCriteria, AccessRules>) {
+fn handle_app_shadowing(rules: &mut BTreeMap<AraMMatchCriteria, AraMAccessRules>) {
     if rules.iter().rev().any(|(criteria, _)| criteria.specificity() == RuleSpecificity::Low) {
         rules.retain(|criteria, _| criteria.specificity() != RuleSpecificity::Least);
     };
+}
+
+/// Convert a TLV object containing ARA-M rules to a [`Vec<Rule>`], preparatory to creating a
+/// [`RuleSet`] (perhaps containing rules from multiple sources).
+pub fn build_rules_from_ara_m_tlv(tlv: tlv::Object) -> Result<Vec<Rule>> {
+    parse_rule_set(tlv, Rule::from_ara_m_tlv).context("Parsing ARA-M rules")
+}
+
+/// Convert a TLV object containing ARA-D rules to a [`Vec<Rule>`], preparatory to creating a
+/// [`RuleSet`] (perhaps containing rules from multiple sources).
+pub fn build_rules_from_ara_d_tlv(tlv: tlv::Object) -> Result<Vec<Rule>> {
+    parse_rule_set(tlv, Rule::from_ara_d_tlv).context("Parsing ARA-D rules")
 }
 
 /// An access rule, specifying the conditions of match and the access permissions/restrictions to
@@ -323,159 +343,146 @@ fn handle_app_shadowing(rules: &mut BTreeMap<MatchCriteria, AccessRules>) {
 ///
 /// Corresponds to REF-AR-DO.  See ARA-M page 68.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Rule {
-    criteria: MatchCriteria,
-    access: AccessRules,
+pub enum Rule {
+    AraM { criteria: AraMMatchCriteria, access: AraMAccessRules },
+    AraD { criteria: AraDMatchCriteria, access: AraDAccessRules },
 }
 
 impl Rule {
-    fn from_tuple(tuple: (MatchCriteria, AccessRules)) -> Self {
-        let (criteria, access) = tuple;
-        Self { criteria, access }
+    /// Create a [`Rule::AraM`] from a tuple of a [`usize`] and a [`tlv::Object`].  The [`usize`]
+    /// represents the position of the object in higher-level structure and is used only for error
+    /// reporting.  Returns [`Err`] if the object does not contain a valid ARA-M REF-AR-DO
+    /// structure.
+    pub(crate) fn from_ara_m_tlv(entry: (usize, tlv::Object)) -> Result<Self> {
+        let (pos, tlv) = entry;
+        Self::from_tlv(tlv, Self::from_ara_m_tuple)
+            .with_context(|| format!("Parsing ARA-M RefArDo at pos {pos}"))
     }
 
-    /// Create a [`Rule`] from a [`tlv::Object`].  Returns [`Err`] if the object does not contain
-    /// a valid REF-AR-DO structure.
-    pub(crate) fn from_tlv(tlv: tlv::Object) -> Result<Rule> {
+    /// Create a [`Rule::AraD`] from a tuple of a [`usize`] and a [`tlv::Object`].  The [`usize`]
+    /// represents the position of hte object in higher-level structure and is used only for error
+    /// reporting.  Returns [`Err`] if the object does not contain a valid ARA-D REF-AR-DO
+    /// structure.
+    pub(crate) fn from_ara_d_tlv(entry: (usize, tlv::Object)) -> Result<Self> {
+        let (pos, tlv) = entry;
+        Self::from_tlv(tlv, Self::from_ara_d_tuple)
+            .with_context(|| format!("Parsing ARA-D RefArDo at pos {pos}"))
+    }
+
+    /// Create a [`Rule`] from an [`xml::RefArDo`].  Returns [`Err`] if the object does not
+    /// contain a valid ARA-M REF-AR-DO structure.
+    pub fn from_xml(ref_ar_do: xml::RefArDo) -> Result<Self> {
+        let criteria = AraMMatchCriteria::from_xml(ref_ar_do.get_match_criteria())?;
+        let access = AraMAccessRules::from_xml(ref_ar_do.get_apdu_access())?;
+        Ok(Rule::AraM { criteria, access })
+    }
+
+    /// Returns true iff this rule matches the given app and applet.
+    pub fn matches(&self, app: &DeviceAppId, aid: &AppletId) -> bool {
+        match self {
+            Rule::AraM { criteria, .. } => criteria.matches(app, aid),
+            Rule::AraD { criteria, .. } => criteria.matches(app),
+        }
+    }
+
+    /// Returns a reference to the access rules for this rule.
+    ///
+    /// It's a little odd that we return ARA-M access specification for both ARA-M and ARA-D
+    /// rules, but the ARA-D specification doesn't detail what "device access" is intented to
+    /// mean, and Android interprets it as "all access", so we treat ARA-D device access
+    /// permission as the same as a maximally-permissive ARA-M rule.
+    pub fn access(&self) -> &AraMAccessRules {
+        match self {
+            Rule::AraM { access, .. } => access,
+            Rule::AraD { access, .. } => access.to_ara_m_access(),
+        }
+    }
+
+    /// Create a [`Rule`] from a [`tlv::Object`] containing an ARA rule structure.  The type of
+    /// ARA rule is specified by the generic arguments (which are inferred from the
+    /// `from_tuple_fn` type).
+    fn from_tlv<MatchCriteria: ConvertibleFromTlv, AccessRules: ConvertibleFromTlv>(
+        tlv: tlv::Object,
+        from_tuple_fn: impl FnOnce((MatchCriteria, AccessRules)) -> Self,
+    ) -> Result<Self> {
         ensure!(*tlv.tag() == tlv::Tag::RefArDo);
         let value = tlv.get_content();
         let tlv::Value::Constructed(vec) = value else {
             bail!("Invalid RefArDo content {}", value);
         };
-        Self::from_tlv_vec(vec).context("Parsing RefArDo")
-    }
 
-    /// Create a [`Rule`] from an [`xml::RefArDo`].  Returns [`Err`] if the object does not
-    /// contain a valid REF-AR-DO structure.
-    pub fn from_xml(ref_ar_do: xml::RefArDo) -> Result<Rule> {
-        let criteria = MatchCriteria::from_xml(ref_ar_do.get_match_criteria())?;
-        let access = AccessRules::from_xml(ref_ar_do.get_apdu_access())?;
-        Ok(Rule { criteria, access })
-    }
+        let mut iter = vec.into_iter().enumerate().filter(should_handle);
 
-    /// Create a [`Rule`] from a vector containing a REF-DO and AR-DO [`tlv::Object`]s.  Returns
-    /// [`Err`] if the objects are not well-formed.
-    fn from_tlv_vec(vec: Vec<tlv::Object<'_>>) -> Result<Rule> {
-        let mut access = None;
-        let mut criteria = None;
+        let criteria = {
+            let (pos, entry) = iter.next().ok_or_else(|| anyhow!("Missing RefDo"))?;
+            ensure!(
+                *entry.tag() == tlv::Tag::RefDo,
+                "Expected RefDo, found {} at pos {pos}",
+                entry.tag()
+            );
+            MatchCriteria::from_tlv(entry).with_context(|| format!("Parsing RefDo at pos {pos}"))?
+        };
 
-        for tlv in vec.into_iter().filter(is_known_tag) {
-            match tlv.tag() {
-                tlv::Tag::RefDo => {
-                    ensure!(access.is_none(), "Found ArDo before RefDo");
-                    ensure!(criteria.is_none(), "Found multiple RefDo");
-                    criteria = Some(MatchCriteria::from_tlv(tlv).context("Parsing RefDo")?);
-                }
-                tlv::Tag::ArDo => {
-                    ensure!(access.is_none(), "Found multiple ArDo");
-                    access = Some(AccessRules::from_tlv(tlv).context("Parsing ArDo")?);
-                }
-                tag => bail!("Invalid tag {:?}", tag),
-            }
+        let access = {
+            let (pos, entry) = iter.next().ok_or_else(|| anyhow!("Missing ArDo"))?;
+            ensure!(
+                *entry.tag() == tlv::Tag::ArDo,
+                "Expected ArDo, found {} at pos {pos}",
+                entry.tag()
+            );
+            AccessRules::from_tlv(entry).with_context(|| format!("Parsing ArDo at pos {pos}"))?
+        };
+
+        if let Some((pos, entry)) = iter.next() {
+            bail!("Extra entry {} at pos {pos}", entry.tag());
         }
 
-        let criteria = criteria.ok_or_else(|| anyhow!("Missing RefDo"))?;
-        let access = access.ok_or_else(|| anyhow!("Missing ArDo"))?;
+        Ok(from_tuple_fn((criteria, access)))
+    }
 
-        Ok(Rule { criteria, access })
+    /// Construct a [`Rule::AraM`] from a tuple of components.
+    fn from_ara_m_tuple(tuple: (AraMMatchCriteria, AraMAccessRules)) -> Self {
+        let (criteria, access) = tuple;
+        Self::AraM { criteria, access }
+    }
+
+    /// Construct a [`Rule::AraD`] from a tuple of components.
+    fn from_ara_d_tuple(tuple: (AraDMatchCriteria, AraDAccessRules)) -> Self {
+        let (criteria, access) = tuple;
+        Self::AraD { criteria, access }
     }
 }
 
-/// Defines the conditions for access.
+/// Defines the ARA-M rule matching conditions
 ///
 /// The order in which rules are applied depends on their match criteria.  This type implements
 /// [`Ord`] so sorted rules are in the order the specification requires them to be evaluated.
 ///
-/// Corresponds to REF-DO.  See ARA-M page 68 and page ARA-D page 41.
+/// Corresponds to REF-DO.  See ARA-M page 68.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct MatchCriteria {
+pub struct AraMMatchCriteria {
     aid_ref: AppletRef,
     hash_ref: DeviceAppIdRef,
-    pkg_ref: Option<DeviceAppPkgRef>,
 }
 
-impl MatchCriteria {
-    /// Create [`MatchCriteria`] from [`tlv::Object`].
-    fn from_tlv(tlv: tlv::Object) -> Result<Self> {
-        ensure!(*tlv.tag() == tlv::Tag::RefDo);
-        match tlv.get_content() {
-            tlv::Value::Constructed(vec) => Self::from_tlv_vec(vec),
-            other => bail!("Invalid RefDo content {}", other),
-        }
-    }
-
+impl AraMMatchCriteria {
     /// Create [`MatchCriteria`] from [`xml::RefDo`].
-    fn from_xml(ref_do: &xml::RefDo) -> Result<MatchCriteria> {
-        Ok(MatchCriteria {
+    fn from_xml(ref_do: &xml::RefDo) -> Result<AraMMatchCriteria> {
+        Ok(AraMMatchCriteria {
             aid_ref: AppletRef::from_xml(ref_do.get_aid_ref())?,
             hash_ref: DeviceAppIdRef::from_xml(ref_do.get_app_id())?,
-            pkg_ref: None,
-        })
-    }
-
-    /// Create [`MatchCriteria`] from a vector containing one of:
-    ///
-    /// 1. AID-REF-DO || DeviceAppID-REF-DO
-    /// 2. DeviceAppID-REF-DO
-    /// 3. DeviceAppID-REF-DO || PKG-REF-DO
-    ///
-    /// (|| represents concatenation).
-    ///
-    /// Case 1 represents an ARA-M  rule.  Cases 2 and 3 are ARA-D rules and apply to all applets;
-    /// carriers apps have "device" access, i.e. access to the entire SE (though the SE will apply
-    /// its own security constraints).  This means that if we don't find an AID-REF-DO, we set
-    /// [`MatchCriteria::aid_ref`] to [`AppletRef::Carrier`].
-    fn from_tlv_vec(vec: Vec<tlv::Object>) -> Result<Self> {
-        ensure!(!vec.is_empty(), "Found empty REF-DO");
-
-        let mut pkg_ref = None;
-        let mut hash_ref = None;
-        let mut aid_ref = AppletRef::Carrier;
-
-        for (pos, entry) in vec.into_iter().filter(is_known_tag).enumerate() {
-            ensure!(pos < 2, "Found {} components in REF-DO", pos + 1);
-            match entry.tag() {
-                tlv::Tag::DeviceAppIdRefDo => {
-                    hash_ref = {
-                        ensure!(hash_ref.is_none());
-                        Some(DeviceAppIdRef::from_tlv(entry)?)
-                    }
-                }
-                tlv::Tag::PkgRefDo => {
-                    ensure!(pos == 1, "PKG-REF-DO found in position {pos}");
-                    ensure!(hash_ref.is_some(), "PKG-REF-DO not preceded by DeviceAppID-REF-DO");
-                    pkg_ref = Some(DeviceAppPkgRef::from_tlv(entry)?)
-                }
-                tlv::Tag::AidRefDoSpecificApplet | tlv::Tag::AidRefDoImplicit => {
-                    ensure!(pos == 0, "AID-REF-DO found in position {pos}");
-                    aid_ref = AppletRef::from_tlv(entry)?
-                }
-                _ => bail!("Invalid tag {} in REF-DO", entry.tag()),
-            }
-        }
-
-        Ok(Self {
-            aid_ref,
-            hash_ref: hash_ref.ok_or_else(|| anyhow!("No DeviceAppId-REF-DO in REF-DO"))?,
-            pkg_ref,
         })
     }
 
     /// Returns true iff these MatchCriteria match the supplied app ID and applet ID.
     fn matches(&self, app_id: &DeviceAppId, aid: &AppletId) -> bool {
-        self.aid_ref.matches(aid)
-            && self.hash_ref.matches(app_id)
-            && self.pkg_ref.as_ref().is_none_or(|p| p.matches(app_id))
+        self.aid_ref.matches(aid) && self.hash_ref.matches(app_id)
     }
 
     /// Calculate the specificity-derived priority of a rule from the booleans indicating whether
     /// the rule specifies a specific AID and/or [`super::DeviceAppId`].  See the priority table
     /// on ARA-M page 27.
     fn specificity(&self) -> RuleSpecificity {
-        if self.aid_ref == AppletRef::Carrier {
-            return RuleSpecificity::Carrier;
-        }
-
         let explicit_aid = self.aid_ref != AppletRef::AllApplets;
         let explicit_app = self.hash_ref != DeviceAppIdRef::AllApplications;
         match (explicit_aid, explicit_app) {
@@ -487,40 +494,159 @@ impl MatchCriteria {
     }
 }
 
-impl PartialOrd for MatchCriteria {
+impl ConvertibleFromTlvVec for AraMMatchCriteria {
+    fn parent_tag() -> tlv::Tag {
+        tlv::Tag::RefDo
+    }
+
+    fn from_tlv_vec(vec: Vec<tlv::Object>) -> Result<Self> {
+        ensure!(!vec.is_empty(), "Found empty ARA-M RefDo");
+
+        let mut iter = vec.into_iter().enumerate().filter(should_handle);
+
+        let aid_ref = match iter.next() {
+            Some((pos, entry))
+                if *entry.tag() == tlv::Tag::AidRefDoSpecificApplet
+                    || *entry.tag() == tlv::Tag::AidRefDoImplicit =>
+            {
+                AppletRef::from_tlv(entry)
+                    .with_context(|| format!("Parsing RefDo at pos {}", pos))?
+            }
+            Some((pos, entry)) => {
+                bail!("Invalid tag {} in REF-DO, expected AID-REF-DO at pos {pos}", entry.tag())
+            }
+            None => bail!("Missing AID-REF-DO"),
+        };
+
+        let hash_ref = match iter.next() {
+            Some((pos, entry)) if *entry.tag() == tlv::Tag::DeviceAppIdRefDo => {
+                DeviceAppIdRef::from_tlv(entry)
+                    .with_context(|| format!("Parsing RefDo at pos {}", pos))?
+            }
+            Some((pos, entry)) => {
+                bail!(
+                    "Invalid tag {} in REF-DO, expected DeviceAppID-REF-DO at pos {pos}",
+                    entry.tag()
+                )
+            }
+            None => bail!("Missing DeviceAppId-REF-DO"),
+        };
+
+        if let Some((pos, entry)) = iter.next() {
+            bail!("Found unexpected {} in REF-DO at pos {pos}", entry.tag());
+        }
+
+        Ok(Self { aid_ref, hash_ref })
+    }
+}
+
+impl PartialOrd for AraMMatchCriteria {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for MatchCriteria {
+impl Ord for AraMMatchCriteria {
     fn cmp(&self, other: &Self) -> Ordering {
         self.specificity()
             .cmp(&other.specificity())
             .then(self.hash_ref.cmp(&other.hash_ref))
-            .then(self.pkg_ref.cmp(&other.pkg_ref))
             .then(self.aid_ref.cmp(&other.aid_ref))
+    }
+}
+
+/// Defines the ARA-D rule conditions for access.
+///
+/// Corresponds to REF-DO.  See ARA-D page 41.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AraDMatchCriteria {
+    hash_ref: DeviceAppIdRef,
+    pkg_ref: Option<DeviceAppPkgRef>,
+}
+
+impl AraDMatchCriteria {
+    /// Returns true iff these MatchCriteria match the supplied app ID.
+    fn matches(&self, app_id: &DeviceAppId) -> bool {
+        self.hash_ref.matches(app_id) && self.pkg_ref.as_ref().is_none_or(|p| p.matches(app_id))
+    }
+}
+
+impl ConvertibleFromTlvVec for AraDMatchCriteria {
+    fn parent_tag() -> tlv::Tag {
+        tlv::Tag::RefDo
+    }
+
+    /// Create [`MatchCriteria`] from a vector containing a DeviceAppId-REF-DO and an optional
+    /// PKG-REF-DO.
+    fn from_tlv_vec(vec: Vec<tlv::Object>) -> Result<Self> {
+        ensure!(!vec.is_empty(), "Found empty ARA-D RefDo");
+
+        let mut iter = vec.into_iter().enumerate().filter(should_handle);
+        let hash_ref = match iter.next() {
+            Some((pos, entry)) if *entry.tag() == tlv::Tag::DeviceAppIdRefDo => {
+                DeviceAppIdRef::from_tlv(entry)
+                    .with_context(|| format!("Parsing RefDo at pos {pos}"))?
+            }
+            Some((pos, entry)) => {
+                bail!(
+                    "Invalid tag {} in REF-DO, expected DeviceAppID-REF-DO at pos {pos}",
+                    entry.tag()
+                )
+            }
+            None => bail!("Missing DeviceAppID-REF-DO"),
+        };
+
+        let pkg_ref = match iter.next() {
+            Some((pos, entry)) if *entry.tag() == tlv::Tag::PkgRefDo => Some(
+                DeviceAppPkgRef::from_tlv(entry)
+                    .with_context(|| format!("Parsing RefDo at pos {pos}"))?,
+            ),
+            Some((pos, entry)) => {
+                bail!("Invalid tag {} in REF-DO, expected PKG-REF-DO at pos {pos}", entry.tag())
+            }
+            None => None,
+        };
+
+        if let Some((pos, entry)) = iter.next() {
+            bail!("Found unexpected {} in REF-DO at pos {pos}", entry.tag());
+        }
+
+        Ok(Self { hash_ref, pkg_ref })
     }
 }
 
 /// Defines the AID matching condition for a [`Rule`].
 ///
-/// Mostly corresponds to AID-REF-DO.  See ARA-M page 66.
-///
-/// The "Carrier" variant is needed for ARA-D integration.  It is used in the case of an ARA-D
-/// rule which doesn't specify AID because carriers have access to all applets.  In that sense
-/// it's similar to the "AllApplets" wildcard case, except that Carrier rules are higher in
-/// priority and not subject to shadowing rules.
+/// Corresponds to AID-REF-DO.  See ARA-M page 66.
 #[derive(PartialEq, Clone, Eq, PartialOrd, Ord)]
 enum AppletRef {
     AllApplets,
     DefaultApplet,
     SpecificApplet(Vec<u8>),
-    Carrier,
 }
 
 impl AppletRef {
-    /// Create a new instance from a [`tlv::Object`].
+    /// Create a new instance from an [`xml::AidRefDo`].
+    fn from_xml(aid_ref_do: &xml::AidRefDo) -> Result<Self> {
+        let aid = aid_ref_do.get_aid();
+        let aid_ref = match aid.len() {
+            0 => Self::AllApplets,
+            _ => Self::SpecificApplet(aid.to_vec()),
+        };
+        Ok(aid_ref)
+    }
+
+    /// Returns true iff the supplied [`AppletId`] matches [`self`]`.
+    fn matches(&self, applet_id: &AppletId) -> bool {
+        match self {
+            AppletRef::AllApplets => true,
+            AppletRef::DefaultApplet => *applet_id == AppletId::DefaultApplet,
+            AppletRef::SpecificApplet(aid) => *applet_id == AppletId::Aid(aid),
+        }
+    }
+}
+
+impl ConvertibleFromTlv for AppletRef {
     fn from_tlv(tlv: tlv::Object) -> Result<Self> {
         match tlv.tag() {
             tlv::Tag::AidRefDoSpecificApplet => match tlv.value() {
@@ -537,31 +663,11 @@ impl AppletRef {
             other => bail!("Found unexpected {other:?}, where AidRefDo expected."),
         }
     }
-
-    /// Create a new instance from an [`xml::AidRefDo`].
-    fn from_xml(aid_ref_do: &xml::AidRefDo) -> Result<Self> {
-        let aid = aid_ref_do.get_aid();
-        let aid_ref = match aid.len() {
-            0 => Self::AllApplets,
-            _ => Self::SpecificApplet(aid.to_vec()),
-        };
-        Ok(aid_ref)
-    }
-
-    /// Returns true iff the supplied [`AppletId`] matches [`self`]`.
-    fn matches(&self, applet_id: &AppletId) -> bool {
-        match self {
-            AppletRef::AllApplets | AppletRef::Carrier => true,
-            AppletRef::DefaultApplet => *applet_id == AppletId::DefaultApplet,
-            AppletRef::SpecificApplet(aid) => *applet_id == AppletId::Aid(aid),
-        }
-    }
 }
 
 impl std::fmt::Debug for AppletRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Carrier => write!(f, "Carrier"),
             Self::AllApplets => write!(f, "AllApplets"),
             Self::DefaultApplet => write!(f, "DefaultApplet"),
             Self::SpecificApplet(arg0) => write!(f, "SpecificApplet({})", hex::encode(arg0)),
@@ -591,25 +697,6 @@ enum DeviceAppIdRef {
 }
 
 impl DeviceAppIdRef {
-    /// Create a new instance from a [`tlv::Object`].
-    fn from_tlv(tlv: tlv::Object) -> Result<Self> {
-        ensure!(*tlv.tag() == tlv::Tag::DeviceAppIdRefDo);
-
-        let app_id_ref = match tlv.value() {
-            tlv::Value::Empty => Self::AllApplications,
-            tlv::Value::Primitive(data) => match data.len() {
-                SHA1_OR_UUID_LEN => Self::Sha1OrUuid((*data).try_into()?),
-                SHA256_LEN => Self::Sha256((*data).try_into()?),
-                _ => bail!("Invalid DeviceAppId content length"),
-            },
-            tlv::Value::Constructed(_) => {
-                bail!("Invalid content {} found in DeviceAppIdRefDo", tlv.value())
-            }
-        };
-
-        Ok(app_id_ref)
-    }
-
     /// Create a new instance from a [`xml::DeviceAppIdRefDo`].
     fn from_xml(deviceappid_ref_do: &xml::DeviceAppIdRefDo) -> Result<Self> {
         let bytes = deviceappid_ref_do.get_app_id();
@@ -638,6 +725,26 @@ impl DeviceAppIdRef {
     }
 }
 
+impl ConvertibleFromTlv for DeviceAppIdRef {
+    fn from_tlv(tlv: tlv::Object) -> Result<Self> {
+        ensure!(*tlv.tag() == tlv::Tag::DeviceAppIdRefDo);
+
+        let app_id_ref = match tlv.value() {
+            tlv::Value::Empty => Self::AllApplications,
+            tlv::Value::Primitive(data) => match data.len() {
+                SHA1_OR_UUID_LEN => Self::Sha1OrUuid((*data).try_into()?),
+                SHA256_LEN => Self::Sha256((*data).try_into()?),
+                _ => bail!("Invalid DeviceAppId content length"),
+            },
+            tlv::Value::Constructed(_) => {
+                bail!("Invalid content {} found in DeviceAppIdRefDo", tlv.value())
+            }
+        };
+
+        Ok(app_id_ref)
+    }
+}
+
 /// Defines an app ID matching condition based on package name.
 ///
 /// This is an ARA-D feature, not an ARA-M feature. See ARA-D page 41.
@@ -645,15 +752,6 @@ impl DeviceAppIdRef {
 pub struct DeviceAppPkgRef(String);
 
 impl DeviceAppPkgRef {
-    /// Create a new instance from a [`tlv::Object`].
-    fn from_tlv(tlv: tlv::Object) -> Result<Self> {
-        ensure!(*tlv.tag() == tlv::Tag::PkgRefDo);
-        match tlv.value() {
-            tlv::Value::Primitive(data) => Ok(DeviceAppPkgRef(ascii_bytes_to_string(data)?)),
-            value => bail!("Invalid content {} found in PkgRefDo", value),
-        }
-    }
-
     fn matches(&self, app_id: &DeviceAppId) -> bool {
         match app_id {
             DeviceAppId::Apk { sha1s: _, sha256s: _, package_names } => {
@@ -673,27 +771,47 @@ fn ascii_bytes_to_string(bytes: &[u8]) -> Result<String> {
     bail!("Non-ASCII content in bytes.")
 }
 
+impl ConvertibleFromTlv for DeviceAppPkgRef {
+    fn from_tlv(tlv: tlv::Object) -> Result<Self> {
+        ensure!(*tlv.tag() == tlv::Tag::PkgRefDo);
+        match tlv.value() {
+            tlv::Value::Primitive(data) => Ok(DeviceAppPkgRef(ascii_bytes_to_string(data)?)),
+            value => bail!("Invalid content {} found in PkgRefDo", value),
+        }
+    }
+}
+
 /// Defines the conditions for access.
 ///
 /// Corresponds to AR-DO, see ARA-M page 69.
 #[derive(Debug, Clone, PartialEq)]
-pub struct AccessRules {
+pub struct AraMAccessRules {
     apdu: ApduAccessRule,
     nfc: NfcAccessRule,
 }
 
-impl AccessRules {
-    // It's convenient to have a static [`NEVER`] rule, so we can return references to it.
-    const NEVER: AccessRules =
-        AccessRules { apdu: ApduAccessRule::Never, nfc: NfcAccessRule::Never };
+impl AraMAccessRules {
+    // It's convenient to have static [`NEVER`] and `[`ALWAYS`] rules, so we can return references to them.
+    const NEVER: AraMAccessRules =
+        AraMAccessRules { apdu: ApduAccessRule::Never, nfc: NfcAccessRule::Never };
+    const ALWAYS: AraMAccessRules =
+        AraMAccessRules { apdu: ApduAccessRule::Always, nfc: NfcAccessRule::Always };
 
-    /// Create [`AccessRules`] from a [`tlv::Object`].
-    fn from_tlv(tlv: tlv::Object) -> Result<Self> {
-        ensure!(*tlv.tag() == tlv::Tag::ArDo);
-        match tlv.get_content() {
-            tlv::Value::Constructed(vec) => Self::from_tlv_vec(vec),
-            content => bail!("Invalid content {content} in ArDo"),
-        }
+    fn from_xml(ar_do: &xml::ArDo) -> Result<Self> {
+        let apdu = ApduAccessRule::from_data(ar_do.get_apdu_access())?;
+        let (apdu, nfc) = handle_partial_ardo(Some(apdu), None)?;
+        Ok(AraMAccessRules { apdu, nfc })
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.apdu.merge(&other.apdu);
+        self.nfc.merge(&other.nfc);
+    }
+}
+
+impl ConvertibleFromTlvVec for AraMAccessRules {
+    fn parent_tag() -> tlv::Tag {
+        tlv::Tag::ArDo
     }
 
     /// Create [`AccessRules`] from a vector of APDU-AR-DO and NFC-AR-DO objects.
@@ -701,34 +819,32 @@ impl AccessRules {
         let mut apdu = None;
         let mut nfc = None;
 
-        for object in obj_vec.into_iter().filter(is_known_tag) {
+        for (pos, object) in obj_vec.into_iter().enumerate().filter(should_handle) {
             match object.tag() {
                 tlv::Tag::ApduArDo => {
-                    ensure!(apdu.is_none(), "Found multiple ApduArDo instances in ArDo");
-                    ensure!(nfc.is_none(), "Found ApduArDo instance after NfcArDo");
-                    apdu =
-                        Some(ApduAccessRule::from_tlv(object).context("Invalid ApduArDo in ArDo")?)
+                    ensure!(
+                        apdu.is_none(),
+                        "Found multiple ApduArDo instances in ArDo at pos {pos}"
+                    );
+                    ensure!(nfc.is_none(), "Found ApduArDo instance after NfcArDo at pos {pos}");
+                    apdu = Some(
+                        ApduAccessRule::from_tlv(object)
+                            .with_context(|| format!("Invalid ApduArDo in ArDo at pos {pos}"))?,
+                    )
                 }
                 tlv::Tag::NfcArDo => {
-                    ensure!(nfc.is_none(), "Found multiple NfcArDo instances in ArDo");
-                    nfc = Some(NfcAccessRule::from_tlv(object).context("Invalid NfcArDo in ArDo")?)
+                    ensure!(nfc.is_none(), "Found multiple NfcArDo instances in ArDo at pos {pos}");
+                    nfc = Some(
+                        NfcAccessRule::from_tlv(object)
+                            .with_context(|| format!("Invalid NfcArDo in ArDo at pos {pos}"))?,
+                    )
                 }
-                _ => bail!("Invalid tag {} in ArDo content", object.tag()),
+                _ => bail!("Invalid tag {} in ArDo content at pos {pos}", object.tag()),
             }
         }
 
         let (apdu, nfc) = handle_partial_ardo(apdu, nfc)?;
-        Ok(AccessRules { apdu, nfc })
-    }
-
-    fn from_xml(ar_do: &xml::ArDo) -> Result<Self> {
-        let apdu = ApduAccessRule::from_data(ar_do.get_apdu_access())?;
-        let (apdu, nfc) = handle_partial_ardo(Some(apdu), None)?;
-        Ok(AccessRules { apdu, nfc })
-    }
-    fn merge(&mut self, other: Self) {
-        self.apdu.merge(other.apdu);
-        self.nfc.merge(other.nfc);
+        Ok(AraMAccessRules { apdu, nfc })
     }
 }
 
@@ -746,6 +862,99 @@ fn handle_partial_ardo(
         (None, None) => bail!("Empty ArDo."),
     };
     Ok((apdu, nfc))
+}
+
+/// Defines the conditions for access.
+///
+/// Corresponds to AR-DO, see ARA-D page 43.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AraDAccessRules {
+    permission_rule: PermissionRule,
+}
+
+impl AraDAccessRules {
+    /// Determine if APDU access is allowed.
+    ///
+    /// It's a little odd that we return ARA-M access specification for an ARA-D rules, but the
+    /// ARA-D specification doesn't detail what "device access" is intented to mean, and Android
+    /// interprets it as "all access", so we treat ARA-D device access permission as the same as a
+    /// maximally-permissive ARA-M rule.
+    fn to_ara_m_access(&self) -> &AraMAccessRules {
+        if self.permission_rule.has_permission() {
+            &AraMAccessRules::ALWAYS
+        } else {
+            &AraMAccessRules::NEVER
+        }
+    }
+}
+
+impl ConvertibleFromTlvVec for AraDAccessRules {
+    fn parent_tag() -> tlv::Tag {
+        tlv::Tag::ArDo
+    }
+
+    fn from_tlv_vec(vec: Vec<tlv::Object>) -> Result<Self> {
+        let mut iter = vec.into_iter().enumerate().filter(should_handle);
+
+        let Some((pos, entry)) = iter.next() else { bail!("Missing PermArDo") };
+        ensure!(*entry.tag() == tlv::Tag::PermArDo);
+        let permission_rule = PermissionRule::from_tlv(entry)
+            .with_context(|| format!("Parsing PermArDo at pos {pos}"))?;
+
+        if let Some((pos, entry)) = iter.next() {
+            bail!("Found unexpected {} in ArDo at pos {pos}", entry.tag());
+        }
+
+        Ok(Self { permission_rule })
+    }
+}
+
+/// Defines which entities have device permissions.
+///
+/// This ARA-D structure is mostly undefined.  It's an eight-byte value with all but three bits
+/// reserved for future use.  The defined bits are:
+///
+/// -  The low-order bit of the fourth byte.  If set, MNO/OEM shared permission is granted.
+/// -  The low-order bit of the sixth byte.  If set, only OEM permission is granted.
+/// -  The low-order bit of the seventh byte.  If set, only MNO permission is granted.
+///
+/// Note that the [`crate::access_enforcer::AccessEnforcer`] does not currently make any
+/// distinction between OEM (device manufacturer) and MNO (mobile service provider) permissions.
+/// If any permission bit is set, a matching app gets APDU access to all apps.
+///
+/// Corresponds to PERM-AR-DO, see ARA-D page 43.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PermissionRule {
+    mno_and_oem: bool,
+    oem_only: bool,
+    mno_only: bool,
+}
+
+impl PermissionRule {
+    fn has_permission(&self) -> bool {
+        self.mno_and_oem || self.oem_only || self.mno_only
+    }
+}
+
+impl ConvertibleFromTlv for PermissionRule {
+    fn from_tlv(tlv: tlv::Object) -> Result<Self> {
+        const MNO_OEM_BYTE: usize = 3;
+        const OEM_ONLY_BYTE: usize = 5;
+        const MNO_ONLY_BYTE: usize = 7;
+
+        ensure!(*tlv.tag() == tlv::Tag::PermArDo);
+        if let tlv::Value::Primitive(data) = tlv.value() {
+            let data: &[u8; 8] = (*data).try_into()?;
+            Ok(Self {
+                mno_and_oem: data[MNO_OEM_BYTE] & 0x01 == 1,
+
+                oem_only: data[OEM_ONLY_BYTE] & 0x01 == 1,
+                mno_only: data[MNO_ONLY_BYTE] & 0x01 == 1,
+            })
+        } else {
+            bail!("Invalid content {} in PermArDo", tlv.value());
+        }
+    }
 }
 
 pub struct ApduHeader([u8; APDU_HEADER_LEN]);
@@ -779,15 +988,6 @@ impl ApduAccessRule {
         }
     }
 
-    /// Create a new instance from a [`tlv::Object`].
-    fn from_tlv(tlv: tlv::Object) -> Result<Self> {
-        ensure!(*tlv.tag() == tlv::Tag::ApduArDo);
-        match tlv.value() {
-            tlv::Value::Primitive(data) => Self::from_data(data),
-            _ => bail!("Invalid content {} in ApduArDo", tlv.value()),
-        }
-    }
-
     /// Create [`ApduAccessRule`] from a buffer containing the content of an APDU-AR-DO object.
     fn from_data(data: &[u8]) -> Result<Self> {
         Ok(match data.len() {
@@ -804,25 +1004,36 @@ impl ApduAccessRule {
     }
 
     /// Merge other into self, always taking the stricter rule.
-    fn merge(&mut self, other: Self) {
+    fn merge(&mut self, other: &Self) {
         // Take ownership of the contents of `self`.
         let mut this = ApduAccessRule::Always;
         std::mem::swap(self, &mut this);
 
         *self = match this {
             ApduAccessRule::Never => ApduAccessRule::Never,
-            ApduAccessRule::Always => other,
+            ApduAccessRule::Always => other.clone(),
             ApduAccessRule::PartialAllow(mut this_set) => match other {
                 ApduAccessRule::Never => ApduAccessRule::Never,
                 ApduAccessRule::Always => ApduAccessRule::PartialAllow(this_set),
-                ApduAccessRule::PartialAllow(mut other_set) => {
-                    this_set.0.append(&mut other_set.0);
+                ApduAccessRule::PartialAllow(other_set) => {
+                    this_set.0.extend_from_slice(other_set.0.as_slice());
                     this_set.0.sort_unstable();
                     this_set.0.dedup();
                     ApduAccessRule::PartialAllow(this_set)
                 }
             },
         };
+    }
+}
+
+impl ConvertibleFromTlv for ApduAccessRule {
+    /// Create a new instance from a [`tlv::Object`].
+    fn from_tlv(tlv: tlv::Object) -> Result<Self> {
+        ensure!(*tlv.tag() == tlv::Tag::ApduArDo);
+        match tlv.value() {
+            tlv::Value::Primitive(data) => Self::from_data(data),
+            _ => bail!("Invalid content {} in ApduArDo", tlv.value()),
+        }
     }
 }
 
@@ -905,15 +1116,6 @@ enum NfcAccessRule {
 }
 
 impl NfcAccessRule {
-    /// Create [`NfcAccessRule`] from a [`tlv::Object`].
-    fn from_tlv(tlv: tlv::Object) -> Result<Self> {
-        ensure!(*tlv.tag() == tlv::Tag::NfcArDo);
-        match tlv.value() {
-            tlv::Value::Primitive(data) => Self::from_data(data),
-            _ => bail!("Invalid content {} in NfcArDo", tlv.value()),
-        }
-    }
-
     /// Create [`NfcAccessRule`] from a buffer containing the content of an NFC-AR-DO object.
     fn from_data(data: &[u8]) -> Result<Self> {
         ensure!(data.len() == 1, "Invalid data length in NfcArDo {}", hex::encode(data));
@@ -925,26 +1127,63 @@ impl NfcAccessRule {
     }
 
     /// Merge the other access rule into self, taking the more restrictive.
-    fn merge(&mut self, other: Self) {
+    fn merge(&mut self, other: &Self) {
         match self {
-            NfcAccessRule::Always => *self = other,
+            NfcAccessRule::Always => *self = *other,
             NfcAccessRule::Never => {}
         }
     }
 }
 
-/// Determine if the referenced object contains a known tag.
-fn is_known_tag(tlv: &tlv::Object) -> bool {
-    if cfg!(feature = "disallow_unknown_ara_tags") {
-        // If we're disallowing unknown ARA tags, this function just claims all tags as known,
-        // allowing the rest of the code to see the unknown tags and emit errors.
-        true
-    } else {
-        let known = !matches!(tlv.tag(), tlv::Tag::Unknown(_));
-        if !known {
-            info!("Ignoring tag {:?}", tlv.tag());
+impl ConvertibleFromTlv for NfcAccessRule {
+    fn from_tlv(tlv: tlv::Object) -> Result<Self> {
+        ensure!(*tlv.tag() == tlv::Tag::NfcArDo);
+        match tlv.value() {
+            tlv::Value::Primitive(data) => Self::from_data(data),
+            _ => bail!("Invalid content {} in NfcArDo", tlv.value()),
         }
-        known
+    }
+}
+
+/// Determine if the referenced object contains a tag that should be handled.
+///
+/// This facilitates allowing unknown tags by (almost) silently ignoring them.  If we're allowing
+/// unknown tags (the default), this function will return false to let the caller know that this
+/// tag should be skipped.  It will logs a warning so the presence of unhandled tags will be noted
+/// in the system log.
+///
+/// If we're not allowing unknown tags, this function returns true for all tags.  Because the
+/// parsing code enforces strict expectations about the tags it should receive this will cause
+/// unknown tags to trigger errors.
+fn should_handle(entry: &(usize, tlv::Object)) -> bool {
+    let (pos, tlv) = entry;
+    match tlv.tag() {
+        tlv::Tag::Unknown(_) if !cfg!(feature = "disallow_unknown_ara_tags") => {
+            warn!("Ignoring tag {:?} at pos {pos}", tlv.tag());
+            false
+        }
+        _ => true,
+    }
+}
+
+fn parse_rule_set<T>(
+    tlv: tlv::Object<'_>,
+    parse_fn: fn((usize, tlv::Object<'_>)) -> Result<T>,
+) -> Result<Vec<T>> {
+    ensure!(*tlv.tag() == tlv::Tag::ResponseAllRefArDo);
+    let value = tlv.get_content();
+    match value {
+        tlv::Value::Empty => Ok(Vec::new()),
+        tlv::Value::Constructed(vec) => vec
+            .into_iter()
+            .enumerate()
+            .filter(should_handle)
+            .map(parse_fn)
+            .collect::<Result<Vec<_>>>()
+            .context("Parsing ResponseAllRefArDo"),
+        tlv::Value::Primitive(_) => {
+            bail!("Invalid content {} for ResponseAllRefArDo", value)
+        }
     }
 }
 

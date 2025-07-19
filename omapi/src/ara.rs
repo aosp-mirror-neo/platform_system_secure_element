@@ -22,7 +22,7 @@ mod rules;
 mod xml;
 
 pub use rules::{
-    ApduAccessRule, ApduHeader, AppletId, DeviceAppId, Rule, RuleCache, Sha1DigestOrUuid,
-    Sha256Digest,
+    build_rules_from_ara_d_tlv, build_rules_from_ara_m_tlv, ApduAccessRule, ApduHeader, AppletId,
+    DeviceAppId, Rule, RuleSet, Sha1DigestOrUuid, Sha256Digest,
 };
 pub use xml::parse_xml_rules;
