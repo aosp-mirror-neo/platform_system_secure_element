@@ -37,21 +37,7 @@ use googletest::{prelude::*, test as gtest, Result};
 use mockall::{predicate as mp, Sequence};
 
 fn init() {
-    android_logger::init_once(
-        android_logger::Config::default()
-            .with_tag("se_service_access_enforcer_test")
-            .with_max_level(log::LevelFilter::Trace)
-            .with_log_buffer(android_logger::LogId::System)
-            .format(|buf, record| {
-                writeln!(
-                    buf,
-                    "{}:{} - {}",
-                    record.file().unwrap_or("unknown"),
-                    record.line().unwrap_or(0),
-                    record.args()
-                )
-            }),
-    );
+    crate::test_utils::init(module_path!());
 }
 
 #[gtest]
