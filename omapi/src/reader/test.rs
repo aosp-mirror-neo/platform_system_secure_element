@@ -44,6 +44,7 @@ fn create_reader() -> Result<()> {
         Ok(se_binder),
         SeSecurityProfile { use_ara_applet: true, full_access: false },
         /* platform_rules */ Ok(vec![]),
+        /* is_caller_privileged_result */ Ok(false),
         |_mock| {},
     );
     let _reader = Reader::new_arc("se_name", WaitForReader(false), system_services)?;
@@ -62,6 +63,7 @@ fn open_and_close_sessions() -> Result<()> {
         Ok(se_binder),
         SeSecurityProfile { use_ara_applet: true, full_access: false },
         /* platform_rules */ Ok(vec![]),
+        /* is_caller_privileged_result */ Ok(false),
         |_mock| {},
     );
     let reader_arc = Reader::new_arc("se_name", WaitForReader(false), system_services)?;
@@ -105,6 +107,7 @@ fn close_on_ara_io_error() -> Result<()> {
         Ok(se_binder),
         SeSecurityProfile { use_ara_applet: true, full_access: false },
         /* platform_rules */ Ok(vec![]),
+        /* is_caller_privileged_result */ Ok(false),
         |mock| {
             mock.expect_get_client_id().returning(|| Ok(ClientId::PackageInfo(vec![])));
         },
@@ -142,6 +145,7 @@ fn close_on_open_session_io_error() -> Result<()> {
         // Full access security profile, to avoid triggering an ARA-M read.
         SeSecurityProfile { use_ara_applet: false, full_access: true },
         /* platform_rules */ Ok(vec![]),
+        /* is_caller_privileged_result */ Ok(false),
         |mock| {
             mock.expect_get_client_id().returning(|| Ok(ClientId::PackageInfo(vec![])));
         },
@@ -183,6 +187,7 @@ fn close_on_transmit_io_error() -> Result<()> {
         // Full access security profile, to avoid triggering an ARA-M read.
         SeSecurityProfile { use_ara_applet: false, full_access: true },
         /* platform_rules */ Ok(vec![]),
+        /* is_caller_privileged_result */ Ok(false),
         |mock| {
             mock.expect_get_client_id().returning(|| Ok(ClientId::PackageInfo(vec![])));
         },
@@ -212,6 +217,94 @@ fn close_on_transmit_io_error() -> Result<()> {
     Ok(())
 }
 
+#[gtest]
+fn reset_privileged_caller() -> Result<()> {
+    init();
+
+    let se_binder = mock_se(|mock| {
+        mock.expect_reset().times(1).returning(|| Ok(())); // HAL reset returns Ok(())
+    });
+
+    let system_services = mock_system_services(
+        Ok(se_binder),
+        SeSecurityProfile { use_ara_applet: false, full_access: true },
+        /* platform_rules */ Ok(vec![]),
+        /* is_caller_privileged_result */ Ok(true),
+        |_mock| {},
+    );
+
+    let reader_arc = Reader::new_arc("ESE0", WaitForReader(true), system_services)?;
+    let reader = reader_arc.lock().unwrap();
+
+    assert_that!(reader.reset(), ok(eq(&true)));
+
+    Ok(())
+}
+
+#[gtest]
+fn reset_non_privileged_caller() -> Result<()> {
+    init();
+
+    let se_binder = mock_se(|_mock| {
+        // No reset expected, so no specific expectation for reset() here.
+    });
+
+    let system_services = mock_system_services(
+        Ok(se_binder),
+        SeSecurityProfile { use_ara_applet: false, full_access: false },
+        /* platform_rules */ Ok(vec![]),
+        /* is_caller_privileged_result */ Ok(false),
+        |_mock| {},
+    );
+
+    let reader_arc = Reader::new_arc("ESE0", WaitForReader(true), system_services)?;
+    let reader = reader_arc.lock().unwrap();
+
+    let result = reader.reset();
+    assert_that!(result, err(anything()));
+    assert_eq!(result.unwrap_err().exception_code(), ExceptionCode::SECURITY);
+
+    Ok(())
+}
+
+#[gtest]
+fn privileged_caller_can_access_any_applet() -> Result<()> {
+    init();
+
+    // Mock SE HAL: openLogicalChannel always succeeds.
+    let se_binder = mock_se(|mock| {
+        mock.expect_isCardPresent().returning(|| Ok(true));
+        mock.expect_openLogicalChannel().times(1).returning(|aid, _p2| {
+            Ok(LogicalChannelResponse { channelNumber: 1, selectResponse: aid.to_vec() })
+        });
+        mock.expect_closeChannel().returning(|_| Ok(()));
+    });
+
+    let system_services = mock_system_services(
+        Ok(se_binder),
+        SeSecurityProfile { use_ara_applet: true, full_access: false },
+        Ok(vec![]), // No rules allow access
+        Ok(true),   // Privileged caller
+        |mock| {
+            mock.expect_get_client_id().returning(|| Ok(ClientId::PackageInfo(vec![])));
+        },
+    );
+
+    let reader_arc = Reader::new_arc("ESE0", WaitForReader(true), system_services)?;
+    let mut reader = reader_arc.lock().unwrap();
+    let session = reader.open_session()?;
+
+    // Try to open a logical channel to a test AID.
+    let test_aid = &[0xA0, 0x00, 0x00, 0x00, 0x62, 0x03, 0x01, 0x0C, 0x01, 0x01];
+    let (channel_id_opt, _policy) = reader.open_logical_channel(session, test_aid, 0x00)?;
+    assert!(
+        channel_id_opt.is_some(),
+        "Privileged caller should be able to open channel even if rules disallow"
+    );
+
+    Ok(())
+}
+
 fn mock_se(expectations: impl FnOnce(&mut MockISecureElement)) -> Strong<dyn ISecureElement> {
     let mut se_mock = MockISecureElement::new();
     se_mock.expect_init().returning(|callback| {
@@ -227,12 +320,14 @@ fn mock_system_services(
     se_hal: binder::Result<Strong<dyn ISecureElement>>,
     security_profile: SeSecurityProfile,
     platform_rules: binder::Result<Vec<Rule>>,
+    is_caller_privileged_result: binder::Result<bool>,
     expectations: impl FnOnce(&mut MockSystemServices),
 ) -> Arc<dyn SystemServices> {
     let mut mock_services = MockSystemServices::new();
     mock_services.expect_get_se_hal().return_once(move |_, _| se_hal);
     mock_services.expect_get_security_profile().return_once(move || security_profile);
     mock_services.expect_get_platform_rules().return_once(move |_| platform_rules);
+    mock_services.expect_is_caller_privileged().return_once(move || is_caller_privileged_result);
     expectations(&mut mock_services);
 
     Arc::new(mock_services)

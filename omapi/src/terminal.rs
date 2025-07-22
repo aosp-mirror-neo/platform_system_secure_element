@@ -494,6 +494,13 @@ const OFFSET_P2: usize = OFFSET_P1 + 1;
 /// Length of APDU header
 const APDU_HEADER_LEN: usize = OFFSET_P2 + 1;
 
+/// "Manage channel" instruction (privileged).
+const INS_MANAGE_CHANNEL: u8 = 0x70;
+
+/// "SELECT" instruction (privileged when P1 is SELECT_BY_DF)
+const INS_SELECT: u8 = 0xA4;
+const P1_SELECT_BY_DF: u8 = 0x04;
+
 /// [`Apdu`] is a newtype for APDU contents.  It exists primarily so it can derive
 /// [`ZeroizeOnDrop`].
 ///
@@ -636,24 +643,23 @@ impl Apdu {
         cla_type == ApduClassType::Iso7816Command || cla_type == ApduClassType::Reserved
     }
 
-    /// Returns [`Err`] if this APDU is a disallowed command.  `privileged_caller` indicates
-    /// whether the caller is allowed to perform some ISO commands.
+    /// Returns [`Err`] if this APDU is a disallowed command.
+    ///
+    /// Some ISO commands are disallowed, unless the caller has privilege or uses secure messaging
+    /// (which requires knowledge of secrets that indicate privilege).
     fn check_disallowed_iso_commands(&self, privileged_caller: bool) -> Result<()> {
-        // TODO: Research why not disallow SM.
-        if self.is_iso_command_class() && !self.uses_gp_secure_messaging() {
-            match self.ins() {
-                0x70 => binder_exception(SECURITY, "MANAGE CHANNEL command not allowed."),
-                0xA4 => {
-                    if self.p1() == 0x04 && !privileged_caller {
-                        binder_exception(SECURITY, "SELECT by DF name command not allowed.")
-                    } else {
-                        Ok(())
-                    }
+        if !self.is_iso_command_class() || self.uses_gp_secure_messaging() || privileged_caller {
+            Ok(())
+        } else {
+            match (self.ins(), self.p1()) {
+                (INS_MANAGE_CHANNEL, _) => {
+                    binder_exception(SECURITY, "MANAGE CHANNEL command not allowed.")
+                }
+                (INS_SELECT, P1_SELECT_BY_DF) => {
+                    binder_exception(SECURITY, "SELECT by DF name command not allowed.")
                 }
                 _ => Ok(()),
             }
-        } else {
-            Ok(())
         }
     }
 }

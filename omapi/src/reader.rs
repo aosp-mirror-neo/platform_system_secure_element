@@ -17,16 +17,19 @@
 
 use crate::{
     access_enforcer::AccessEnforcer,
-    ara::ApduAccessRule,
+    ara::{ApduAccessRule, ApduHeader},
     system_services::{SystemServices, WaitForReader},
     terminal::{ApduResponse, ChannelId, SendSelectOnClose, Terminal},
     utils::{binder_exception, service_specific_exception,
-        ServiceSpecificException::{IoError, SecureElementNotPresent}
+        ServiceSpecificException::{IoError, SecureElementNotPresent},
      },
 };
 use android_hardware_secure_element::aidl::android::hardware::secure_element::ISecureElementCallback::{
-    BnSecureElementCallback, ISecureElementCallback};
-use binder::{BinderFeatures, ExceptionCode::{SERVICE_SPECIFIC, ILLEGAL_STATE}, Result, Status, Strong};
+    BnSecureElementCallback, ISecureElementCallback,
+};
+use binder::{
+    BinderFeatures, ExceptionCode::{ILLEGAL_STATE, SECURITY, SERVICE_SPECIFIC}, Result, Status, Strong,
+};
 use log::{debug, error, info, trace};
 use std::{
     collections::HashMap,
@@ -35,6 +38,33 @@ use std::{
 
 #[cfg(test)]
 mod test;
+
+/// [`AccessPolicy`] describes the access for a particular caller to a particular applet.
+#[derive(Clone, Debug)]
+pub enum AccessPolicy {
+    /// [`AccessPolicy::Normal`] access is defined by ARA rules, and may include restrictions on
+    /// the set of allowed APDUs, as indicated by the contained [`ApduAccessRule`].
+    Normal(ApduAccessRule),
+    /// [`AccessPolicy::PrivilegedCaller`] access is for clients with the
+    /// "SECURE_ELEMENT_PRIVILEGED_OPERATION" permission.  They can access all applets and reset
+    /// the SE.
+    PrivilegedCaller,
+}
+
+impl AccessPolicy {
+    /// Returns true iff the caller is allowed to send APDUs with the specified header.
+    pub fn allow_apdu(&self, apdu_header: &ApduHeader) -> bool {
+        match self {
+            AccessPolicy::Normal(apdu_access_rule) => apdu_access_rule.allow_apdu(apdu_header),
+            AccessPolicy::PrivilegedCaller => true,
+        }
+    }
+
+    /// Returns true iff the caller has access to all applets and to reset the SE.
+    pub fn privileged_caller(&self) -> bool {
+        matches!(self, AccessPolicy::PrivilegedCaller)
+    }
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SessionId(pub u64);
@@ -128,7 +158,7 @@ impl Reader {
         session_id: SessionId,
         aid: &[u8],
         p2: i8,
-    ) -> Result<(Option<ChannelId>, ApduAccessRule)> {
+    ) -> Result<(Option<ChannelId>, AccessPolicy)> {
         self.open_channel_internal(ChannelType::Basic, session_id, aid, p2)
             .inspect_err(|err| self.close_on_ioerror(err))
     }
@@ -138,7 +168,7 @@ impl Reader {
         session_id: SessionId,
         aid: &[u8],
         p2: i8,
-    ) -> Result<(Option<ChannelId>, ApduAccessRule)> {
+    ) -> Result<(Option<ChannelId>, AccessPolicy)> {
         self.open_channel_internal(ChannelType::Logical, session_id, aid, p2)
             .inspect_err(|err| self.close_on_ioerror(err))
     }
@@ -216,9 +246,13 @@ impl Reader {
         !self.sessions.contains_key(&session_id)
     }
 
-    pub fn reset(&self) -> bool {
+    /// Reset (reboot, essentially) the SE.
+    pub fn reset(&self) -> Result<bool> {
+        if !self.system_services.is_caller_privileged()? {
+            return binder_exception(SECURITY, "Caller is not privileged to reset SE");
+        }
         // TODO: Find out whether this needs to clean up sessions/channels.
-        self.terminal.reset()
+        Ok(self.terminal.reset())
     }
 
     fn open_channel_internal(
@@ -227,7 +261,7 @@ impl Reader {
         session_id: SessionId,
         aid: &[u8],
         p2: i8,
-    ) -> Result<(Option<ChannelId>, ApduAccessRule)> {
+    ) -> Result<(Option<ChannelId>, AccessPolicy)> {
         let policy = self.get_access_policy(aid)?;
         let channel_id = match channel_type {
             ChannelType::Basic => self.terminal.open_basic_channel(aid, p2)?,
@@ -270,23 +304,27 @@ impl Reader {
         self.access_enforcer.reset();
     }
 
-    fn get_access_policy(&mut self, aid: &[u8]) -> Result<ApduAccessRule> {
+    fn get_access_policy(&mut self, aid: &[u8]) -> Result<AccessPolicy> {
         let client_id = self.system_services.get_client_id()?;
+        if self.system_services.is_caller_privileged()? {
+            trace!("Caller is privileged, allowing all APDUs, to all applets");
+            return Ok(AccessPolicy::PrivilegedCaller);
+        }
 
         // Special case:  If we haven't read the applet rules yet but the platform rules allow
         // the access, use that result without waiting to read ARA rules.
         if !self.access_enforcer.have_applet_rules() {
             trace!("No applet rules, checking platform rules.");
-            if let Ok(policy) = self.access_enforcer.get_policy(aid, &client_id) {
+            if let Ok(apdu_policy) = self.access_enforcer.get_policy(aid, &client_id) {
                 trace!("Platform rules allowed");
-                return Ok(policy.clone());
+                return Ok(AccessPolicy::Normal(apdu_policy.clone()));
             }
             trace!("Platform rules didn't allow");
         }
 
         // Normal case: Update the rule cache before retrieving policy.
         self.update_rules()?;
-        self.access_enforcer.get_policy(aid, &client_id)
+        Ok(AccessPolicy::Normal(self.access_enforcer.get_policy(aid, &client_id)?))
     }
 
     /// Update the rule cache.    In most cases this is relatively quick, requiring one APDU
