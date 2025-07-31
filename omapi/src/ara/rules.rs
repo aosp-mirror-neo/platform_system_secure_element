@@ -657,7 +657,7 @@ impl DeviceAppPkgRef {
     fn matches(&self, app_id: &DeviceAppId) -> bool {
         match app_id {
             DeviceAppId::Apk { sha1s: _, sha256s: _, package_names } => {
-                package_names.iter().any(|p| *p == self.0)
+                package_names.contains(&self.0)
             }
             DeviceAppId::SystemComponent { uuids: _ } => false,
         }
