@@ -75,7 +75,7 @@ impl CacheState {
         let se_refresh_tag = read_refresh_tag(terminal, channel_id).trace("Refresh tag").ok();
 
         if self.refresh_tag.is_some() && se_refresh_tag == self.refresh_tag {
-            info!("Refresh tag {:?} unchanged. Using cached access rules.", se_refresh_tag);
+            info!("Refresh tag {se_refresh_tag:?} unchanged. Using cached access rules.");
             return Ok(());
         } else if se_refresh_tag.is_none() {
             error!("Refresh tag could not be retrieved.")
