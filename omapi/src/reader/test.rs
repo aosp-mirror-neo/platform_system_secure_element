@@ -17,8 +17,10 @@
 
 use super::*;
 use crate::{
-    ara::Rule,
+    access_enforcer::{ARA_D_AID, ARA_M_AID, GET_ALL_APDU, GET_REFRESH_TAG_APDU},
+    ara::{tlv, Rule},
     system_services::{ClientId, MockSystemServices, SeSecurityProfile},
+    terminal::Apdu,
     utils::ServiceSpecificException,
 };
 use android_hardware_secure_element::aidl::android::hardware::secure_element::{
@@ -27,6 +29,7 @@ use android_hardware_secure_element::aidl::android::hardware::secure_element::{
 };
 use binder::ExceptionCode;
 use googletest::{prelude::*, test as gtest, Result};
+use mockall::predicate as mp;
 
 const DEFAULT_AID: &[u8] = &[];
 const TEST_P2: i8 = 0x00;
@@ -87,6 +90,36 @@ fn open_and_close_sessions() -> Result<()> {
     assert_that!(reader.is_session_closed(session1), eq(true));
     assert_that!(reader.is_session_closed(session2), eq(true));
     assert_that!(reader.is_session_closed(session3), eq(true));
+
+    Ok(())
+}
+
+#[gtest]
+fn is_secure_element_present() -> Result<()> {
+    init();
+
+    check_is_secure_element_present(true)?;
+    check_is_secure_element_present(false)?;
+
+    Ok(())
+}
+
+fn check_is_secure_element_present(present: bool) -> Result<()> {
+    let se_binder = mock_se(|mock| {
+        mock.expect_isCardPresent().returning(move || Ok(present));
+    });
+    let system_services = mock_system_services(
+        Ok(se_binder),
+        SeSecurityProfile { use_ara_applet: false, full_access: true },
+        /* platform_rules */ Ok(vec![]),
+        /* is_caller_privileged_result */ Ok(true),
+        |_mock| {},
+    );
+
+    let reader_arc = Reader::new_arc("se_name", WaitForReader(false), system_services)?;
+    let reader = reader_arc.lock().unwrap();
+
+    assert_that!(reader.is_secure_element_present()?, eq(present));
 
     Ok(())
 }
@@ -303,6 +336,195 @@ fn privileged_caller_can_access_any_applet() -> Result<()> {
     );
 
     Ok(())
+}
+
+/// [`Reader`] should handle the case where the ARA-M apple is not present but the ARA-D applet is.
+#[gtest]
+fn missing_ara_m() -> Result<()> {
+    init();
+    assert_that!(
+        check_missing_ara_applets(false, true)?,
+        eq(&(Some(ChannelId(1)), AccessPolicy::Normal(ApduAccessRule::Always)))
+    );
+    Ok(())
+}
+
+/// [`Reader`] should handle the case where the ARA-D applet is not present but the ARA-M applet is.
+#[gtest]
+fn missing_ara_d() -> Result<()> {
+    init();
+    assert_that!(
+        check_missing_ara_applets(true, false)?,
+        eq(&(Some(ChannelId(1)), AccessPolicy::Normal(ApduAccessRule::Always)))
+    );
+    Ok(())
+}
+
+/// [`Reader`] should handle the case where both applets are missing, resulting in a denial.
+#[gtest]
+fn missing_both_ara_applets() -> Result<()> {
+    init();
+    let result = check_missing_ara_applets(false, false);
+    assert_eq!(result.unwrap_err().exception_code(), ExceptionCode::SECURITY);
+    Ok(())
+}
+
+fn check_missing_ara_applets(
+    ara_m_present: bool,
+    ara_d_present: bool,
+) -> binder::Result<(Option<ChannelId>, AccessPolicy)> {
+    let se_binder = mock_se(|mock| {
+        mock.expect_isCardPresent().returning(|| Ok(true));
+        expect_ara_m_request(mock, ara_m_present);
+        expect_ara_d_request(mock, ara_d_present);
+        mock.expect_openLogicalChannel().with(mp::eq(DEFAULT_AID), mp::eq(TEST_P2)).returning(
+            move |_aid, _p2| {
+                Ok(LogicalChannelResponse { channelNumber: 1, selectResponse: vec![] })
+            },
+        );
+    });
+    let system_services = mock_system_services(
+        Ok(se_binder),
+        SeSecurityProfile { use_ara_applet: true, full_access: false },
+        /* platform_rules */ Ok(vec![]),
+        /* is_caller_privileged_result */ Ok(false),
+        |mock| {
+            mock.expect_get_client_id().returning(|| Ok(ClientId::PackageInfo(vec![])));
+        },
+    );
+    let reader_arc = Reader::new_arc("se_name", WaitForReader(false), system_services)?;
+    let mut reader = reader_arc.lock().unwrap();
+    let session = reader.open_session()?;
+
+    reader.open_logical_channel(session, DEFAULT_AID, TEST_P2)
+}
+
+fn expect_ara_d_request(mock: &mut MockISecureElement, is_present: bool) {
+    mock.expect_openLogicalChannel().with(mp::eq(ARA_D_AID), mp::eq(0)).returning(
+        move |_aid, _p2| {
+            if is_present {
+                Ok(LogicalChannelResponse { channelNumber: 1, selectResponse: vec![] })
+            } else {
+                service_specific_exception(
+                    ServiceSpecificException::NoSuchElement,
+                    "No such element",
+                )
+            }
+        },
+    );
+
+    if !is_present {
+        return;
+    }
+
+    // The open for the ARA-D applet succeeded, handle retrieval of an allow-all rule.
+    expect_transmit(
+        mock,
+        GET_REFRESH_TAG_APDU,
+        &tlv::Object::new(tlv::Tag::ResponseRefreshTagDo, tlv::Value::Primitive(&[0; 8])).to_ber(),
+    );
+
+    // ARA-D rule set containing a rule that allows all apps access to all applets.
+    let permissive_rule_set = tlv::Object::new(
+        tlv::Tag::ResponseAllRefArDo,
+        tlv::Value::Constructed(vec![tlv::Object::new(
+            tlv::Tag::RefArDo,
+            tlv::Value::Constructed(vec![
+                tlv::Object::new(
+                    tlv::Tag::RefDo,
+                    tlv::Value::Constructed(vec![tlv::Object::new(
+                        tlv::Tag::DeviceAppIdRefDo,
+                        tlv::Value::Primitive(&[/* all apps */]),
+                    )]),
+                ),
+                tlv::Object::new(
+                    tlv::Tag::ArDo,
+                    tlv::Value::Constructed(vec![tlv::Object::new(
+                        tlv::Tag::PermArDo,
+                        tlv::Value::Primitive(&[0, 0, 0, 1, 0, 0, 0, 0 /* Always allow */]),
+                    )]),
+                ),
+            ]),
+        )]),
+    )
+    .to_ber();
+
+    expect_transmit(mock, GET_ALL_APDU, &permissive_rule_set);
+    mock.expect_closeChannel().returning(|_| Ok(()));
+}
+
+fn expect_ara_m_request(mock: &mut MockISecureElement, is_present: bool) {
+    mock.expect_openLogicalChannel().with(mp::eq(ARA_M_AID), mp::eq(0)).returning(
+        move |_aid, _p2| {
+            if is_present {
+                Ok(LogicalChannelResponse { channelNumber: 1, selectResponse: vec![] })
+            } else {
+                service_specific_exception(
+                    ServiceSpecificException::NoSuchElement,
+                    "No such element",
+                )
+            }
+        },
+    );
+
+    if !is_present {
+        return;
+    }
+
+    // The open for the ARA-M applet succeeded, handle retrieval of an allow-all rule.
+    expect_transmit(
+        mock,
+        GET_REFRESH_TAG_APDU,
+        &tlv::Object::new(tlv::Tag::ResponseRefreshTagDo, tlv::Value::Primitive(&[0; 8])).to_ber(),
+    );
+
+    // ARA-M rule set containing a rule that allows all apps access to all applets.
+    let permissive_rule_set = tlv::Object::new(
+        tlv::Tag::ResponseAllRefArDo,
+        tlv::Value::Constructed(vec![tlv::Object::new(
+            tlv::Tag::RefArDo,
+            tlv::Value::Constructed(vec![
+                tlv::Object::new(
+                    tlv::Tag::RefDo,
+                    tlv::Value::Constructed(vec![
+                        tlv::Object::new(
+                            tlv::Tag::AidRefDoSpecificApplet,
+                            tlv::Value::Primitive(&[/* all AIDs */]),
+                        ),
+                        tlv::Object::new(
+                            tlv::Tag::DeviceAppIdRefDo,
+                            tlv::Value::Primitive(&[/* all apps */]),
+                        ),
+                    ]),
+                ),
+                tlv::Object::new(
+                    tlv::Tag::ArDo,
+                    tlv::Value::Constructed(vec![tlv::Object::new(
+                        tlv::Tag::ApduArDo,
+                        tlv::Value::Primitive(&[1 /* Always allow */]),
+                    )]),
+                ),
+            ]),
+        )]),
+    )
+    .to_ber();
+
+    expect_transmit(mock, GET_ALL_APDU, &permissive_rule_set);
+    mock.expect_closeChannel().returning(|_| Ok(()));
+}
+
+fn expect_transmit(mock: &mut MockISecureElement, apdu: &[u8], response: &[u8]) {
+    let response = [response, &[0x90, 0x00][..]].concat();
+    mock.expect_transmit()
+        .times(1)
+        .with(mp::eq(set_channel(1, apdu)))
+        .return_once(move |_| Ok(response));
+}
+
+fn set_channel(channel: i8, apdu: &[u8]) -> Vec<u8> {
+    let apdu =
+        Apdu::new(apdu, Some(ChannelId(channel))).expect("We shouldn't be using invalid APDUs");
+    apdu.0.clone()
 }
 
 fn mock_se(expectations: impl FnOnce(&mut MockISecureElement)) -> Strong<dyn ISecureElement> {

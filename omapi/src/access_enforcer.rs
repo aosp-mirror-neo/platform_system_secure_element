@@ -21,15 +21,17 @@
 
 use crate::{
     ara::{
+        build_rules_from_ara_d_tlv, build_rules_from_ara_m_tlv,
         tlv::{self, Parseable, Tag},
-        ApduAccessRule, AppletId, DeviceAppId, Rule, RuleCache,
+        ApduAccessRule, AppletId, DeviceAppId, Rule, RuleSet,
     },
     system_services::{ClientId, SeSecurityProfile},
     terminal::{ApduResponse, ChannelId, SendSelectOnClose, Terminal},
     utils::{binder_exception, create_exception_status, TraceResultExt},
 };
+use android_hardware_secure_element::aidl::android::hardware::secure_element::ISecureElement as HwSe;
 use binder::{
-    ExceptionCode::{ILLEGAL_ARGUMENT, ILLEGAL_STATE, SECURITY},
+    ExceptionCode::{ILLEGAL_ARGUMENT, ILLEGAL_STATE, SECURITY, SERVICE_SPECIFIC},
     Result,
 };
 use log::{debug, error, info, trace};
@@ -41,8 +43,11 @@ mod test;
 /// It's available to be customized by OEMs if their device or modem has problems with Le = 0x00.
 pub(crate) const CONFIGURABLE_LE: u8 = 0x00;
 
-/// AID of ARA-[M|D] applet.
+/// AID of ARA-M applet.
 pub const ARA_M_AID: &[u8] = &[0xA0, 0x00, 0x00, 0x01, 0x51, 0x41, 0x43, 0x4C, 0x00];
+
+/// AID of ARA-D applet.
+pub const ARA_D_AID: &[u8] = &[0xA0, 0x00, 0x00, 0x01, 0x51, 0x44, 0x41, 0x43, 0x00];
 
 // APDU to get the ARA refresh tag.
 pub const GET_REFRESH_TAG_APDU: &[u8] = &[0x80, 0xCA, 0xDF, 0x20, CONFIGURABLE_LE];
@@ -54,36 +59,91 @@ pub const GET_ALL_APDU: &[u8] = &[0x80, 0xCA, 0xFF, 0x40, CONFIGURABLE_LE];
 // in the response to the [`GET_ALL`] APDU.
 pub const GET_NEXT_APDU: &[u8] = &[0x80, 0xCA, 0xFF, 0x60, CONFIGURABLE_LE];
 
-#[derive(Clone, Debug)]
-struct CacheState {
-    rules: RuleCache,
-    refresh_tag: Option<RefreshTagDo>,
-    platform_rules: Vec<Rule>,
+#[derive(Clone, Copy, Debug)]
+enum RuleType {
+    AraM,
+    AraD,
 }
 
-impl CacheState {
-    fn new(platform_rules: Vec<Rule>) -> Self {
-        CacheState {
-            rules: RuleCache::new(platform_rules.clone()),
-            refresh_tag: None,
-            platform_rules,
+impl RuleType {
+    fn aid(&self) -> &'static [u8] {
+        match self {
+            RuleType::AraM => ARA_M_AID,
+            RuleType::AraD => ARA_D_AID,
         }
     }
 
+    fn build_rules(&self, tlv: tlv::Object) -> Result<Vec<Rule>> {
+        match self {
+            RuleType::AraM => build_rules_from_ara_m_tlv(tlv),
+            RuleType::AraD => build_rules_from_ara_d_tlv(tlv),
+        }
+        .map_err(|e| {
+            create_exception_status(
+                ILLEGAL_ARGUMENT,
+                &format!("Error validating {self:?} rules {e:?}"),
+            )
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RuleCache {
+    rule_type: RuleType,
+    refresh_tag: Option<RefreshTagDo>,
+    rules: Vec<Rule>,
+}
+
+impl RuleCache {
+    fn new(rule_type: RuleType) -> Self {
+        RuleCache { rule_type, rules: Vec::new(), refresh_tag: None }
+    }
+
     /// Update cache, reading rules from the SE if the refresh tag has changed.
-    fn update(&mut self, terminal: &Terminal, channel_id: ChannelId) -> Result<()> {
+    fn update(&mut self, terminal: &mut Terminal) -> Result<()> {
+        let channel_id = match terminal.open_logical_channel(self.rule_type.aid(), 0x00) {
+            Ok(Some(channel_id)) => channel_id,
+            Ok(None) => {
+                error!("Unable to open SE channel to get {:?} rules.", self.rule_type);
+                self.reset();
+                return Ok(());
+            }
+            Err(e)
+                if e.exception_code() == SERVICE_SPECIFIC
+                    && e.service_specific_error() == HwSe::NO_SUCH_ELEMENT_ERROR =>
+            {
+                info!("No {:?} applet found.", self.rule_type);
+                self.reset();
+                return Ok(());
+            }
+            Err(e) => {
+                error!("Unable to open SE channel to get {:?} rules: {e}.", self.rule_type);
+                self.reset();
+                return Err(e);
+            }
+        };
+
+        trace!("Opened {channel_id}");
+        let result = self.update_in_channel(terminal, channel_id);
+        let _ = terminal.close_channel(channel_id, SendSelectOnClose(false));
+        result
+    }
+
+    fn update_in_channel(&mut self, terminal: &mut Terminal, channel_id: ChannelId) -> Result<()> {
         let se_refresh_tag = read_refresh_tag(terminal, channel_id).trace("Refresh tag").ok();
 
         if self.refresh_tag.is_some() && se_refresh_tag == self.refresh_tag {
             info!("Refresh tag {se_refresh_tag:?} unchanged. Using cached access rules.");
             return Ok(());
-        } else if se_refresh_tag.is_none() {
+        }
+
+        if se_refresh_tag.is_none() {
             error!("Refresh tag could not be retrieved.")
         } else {
             info!("Refresh tag {:?} changed to {:?}.", self.refresh_tag, se_refresh_tag);
         }
 
-        match read_rule_data(terminal, channel_id, self.platform_rules.clone()) {
+        match read_rule_data(terminal, channel_id, self.rule_type) {
             Ok(rules) => {
                 self.rules = rules;
                 self.refresh_tag = se_refresh_tag;
@@ -99,27 +159,36 @@ impl CacheState {
 
     /// Reset the cache.
     fn reset(&mut self) {
-        self.rules = RuleCache::new(self.platform_rules.iter().cloned());
+        self.rules.clear();
         self.refresh_tag = None;
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct AccessEnforcer {
-    rule_cache: CacheState,
+    rules: RuleSet,
+    ara_m_cache: RuleCache,
+    ara_d_cache: RuleCache,
+    platform_rules: Vec<Rule>,
     security_profile: SeSecurityProfile,
 }
 
 impl AccessEnforcer {
     pub fn new(security_profile: SeSecurityProfile, platform_rules: Vec<Rule>) -> Self {
-        AccessEnforcer { rule_cache: CacheState::new(platform_rules), security_profile }
+        AccessEnforcer {
+            rules: RuleSet::new(platform_rules.iter().cloned()),
+            ara_m_cache: RuleCache::new(RuleType::AraM),
+            ara_d_cache: RuleCache::new(RuleType::AraD),
+            platform_rules,
+            security_profile,
+        }
     }
 
     /// Update the cached rules if necessary.  Returns [`Err`] if there was a problem
     /// communicating with the SE.
     ///
     /// Note that even if the rules haven't changed, this function is moderately expensive because
-    /// it opens a logical channel and sends an APDU to the SE to get the refresh tag.
+    /// it opens two logical channels and sends APDUs to the SE to get the refresh tags.
     ///
     /// Does nothing if the security profile indicates we're not using ARA.
     pub fn update_rule_cache(&mut self, terminal: &mut Terminal) -> Result<()> {
@@ -128,31 +197,26 @@ impl AccessEnforcer {
             return Ok(());
         }
 
-        debug!("Opening logical channel for ARA-M applet.");
-        match terminal.open_logical_channel(Self::get_aid(), 0x00) {
-            Ok(Some(channel_id)) => {
-                trace!("Opened {channel_id}");
-                let result = self.rule_cache.update(terminal, channel_id);
-                let _ = terminal.close_channel(channel_id, SendSelectOnClose(false));
-                result
-            }
-            Ok(None) => {
-                error!("Unable to open SE channel to get ARA rules.");
-                self.rule_cache.reset();
-                Ok(())
-            }
-            Err(e) => {
-                error!("Unable to open SE channel to get ARA rules: {e}.");
-                self.rule_cache.reset();
-                Err(e)
-            }
-        }
+        self.ara_m_cache.update(terminal)?;
+        self.ara_d_cache.update(terminal)?;
+        self.rules = RuleSet::new(
+            self.ara_d_cache
+                .rules
+                .iter()
+                .chain(self.ara_m_cache.rules.iter())
+                .chain(self.platform_rules.iter())
+                .cloned(),
+        );
+
+        Ok(())
     }
 
-    /// Clear the rule cache, removing any rules retrieved from the ARA applet and resetting the
-    /// refresh tag to force re-reading.
+    /// Clear the rule cache, removing any rules retrieved from the ARA applets and resetting the
+    /// refresh tags to force re-reading.
     pub fn reset(&mut self) {
-        self.rule_cache.reset()
+        self.ara_m_cache.reset();
+        self.ara_d_cache.reset();
+        self.rules = RuleSet::new(self.platform_rules.iter().cloned());
     }
 
     /// Get APDU access policy for the specified AID, for the current caller.
@@ -164,7 +228,7 @@ impl AccessEnforcer {
         let app_id = client_id_to_app_id(client_id);
         let applet_id = AppletId::new(aid);
 
-        let policy = self.rule_cache.rules.get_apdu_rule(&app_id, &applet_id);
+        let policy = self.rules.get_apdu_rule(&app_id, &applet_id);
         if *policy == ApduAccessRule::Never {
             debug!("Access denied for AID {} with caller info {client_id}", hex::encode(aid));
             binder_exception(SECURITY, "APDU access disallowed by policy")
@@ -180,19 +244,14 @@ impl AccessEnforcer {
         client_ids: &[ClientId],
     ) -> Result<Vec<bool>> {
         let aid = AppletId::new(aid.unwrap_or_default());
-        let rules = &self.rule_cache.rules;
         Ok(client_ids
             .iter()
-            .map(|client_id| rules.check_nfc(&client_id_to_app_id(client_id), &aid))
+            .map(|client_id| self.rules.check_nfc(&client_id_to_app_id(client_id), &aid))
             .collect())
     }
 
     pub fn have_applet_rules(&self) -> bool {
-        self.rule_cache.refresh_tag.is_some()
-    }
-
-    const fn get_aid() -> &'static [u8] {
-        ARA_M_AID
+        self.ara_m_cache.refresh_tag.is_some() || self.ara_d_cache.refresh_tag.is_some()
     }
 }
 
@@ -234,8 +293,8 @@ fn check_status(response: &ApduResponse, context: &str) -> Result<()> {
 fn read_rule_data(
     terminal: &Terminal,
     channel_id: ChannelId,
-    platform_rules: Vec<Rule>,
-) -> Result<RuleCache> {
+    rule_type: RuleType,
+) -> Result<Vec<Rule>> {
     info!("Reading ARA rules.");
     let privileged_caller = false;
     let mut response = terminal.transmit(channel_id, GET_ALL_APDU, privileged_caller)?;
@@ -269,10 +328,7 @@ fn read_rule_data(
     }
     trace!("Parsed ARA rule TLV objects: {tlv:#?}");
 
-    let ara_rules = RuleCache::tlv_to_rules(tlv).map_err(|e| {
-        create_exception_status(ILLEGAL_ARGUMENT, &format!("Error validating ARA rules {e:?}"))
-    })?;
-    Ok(RuleCache::new(ara_rules.into_iter().chain(platform_rules.clone())))
+    rule_type.build_rules(tlv)
 }
 
 #[derive(Clone, Copy, PartialEq)]

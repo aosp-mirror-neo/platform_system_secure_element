@@ -18,7 +18,7 @@
 use crate::{
     access_enforcer::AccessEnforcer,
     ara::{ApduAccessRule, ApduHeader},
-    system_services::{SystemServices, WaitForReader},
+    system_services::{SeSecurityProfile, SystemServices, WaitForReader},
     terminal::{ApduResponse, ChannelId, SendSelectOnClose, Terminal},
     utils::{binder_exception, service_specific_exception,
         ServiceSpecificException::{IoError, SecureElementNotPresent},
@@ -40,7 +40,7 @@ use std::{
 mod test;
 
 /// [`AccessPolicy`] describes the access for a particular caller to a particular applet.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum AccessPolicy {
     /// [`AccessPolicy::Normal`] access is defined by ARA rules, and may include restrictions on
     /// the set of allowed APDUs, as indicated by the contained [`ApduAccessRule`].
@@ -249,7 +249,7 @@ impl Reader {
     /// Reset (reboot, essentially) the SE.
     pub fn reset(&self) -> Result<bool> {
         if !self.system_services.is_caller_privileged()? {
-            return binder_exception(SECURITY, "Caller is not privileged to reset SE");
+            return binder_exception(SECURITY, "Caller is not authorized to reset SE");
         }
         // TODO: Find out whether this needs to clean up sessions/channels.
         Ok(self.terminal.reset())
@@ -290,11 +290,11 @@ impl Reader {
 
         self.terminal.set_connected(connected);
 
-        // The Java OMAPI service starts the process of initializing the access enforcer here,
-        // reading rules from the ARA applet.  We instead defer reading of rules to the first app
-        // that tries to talk to the SE which isn't authorized by platform rules.  This is because
-        // the first apps that try to use the SE are probably authorized by platform rules and
-        // there's no reason to make the SE busy and block them while the ARA rules are read.
+        // The Java OMAPI service starts the process of initializing the access enforcer when
+        // onStateChange() occurs, reading rules from the ARA applet.  We instead defer reading of
+        // rules to the first app that tries to talk to the SE which isn't authorized by platform
+        // rules.  This is because the first apps that try to use the SE are probably authorized
+        // by platform rules and there's no reason to make them wait while SE rules are read.
         //
         // Note that the Java service doesn't even start running until the first app tries to use
         // it, meaning the first such app always has to wait for rules to be read so this
@@ -331,14 +331,16 @@ impl Reader {
     /// exchange to check that the refresh tag has not changed.  If the rules have changed, it
     /// will take longer.
     fn update_rules(&mut self) -> Result<()> {
-        // The AccessEnforcer copy is a workaround for the borrow checker's conservatism.  It
-        // won't let us borrow both reader.terminal and reader.access_enforcer at the same time
-        // because that would be two mutable borrows of (parts of) reader.  Instead, we clone
-        // reader.access_enforcer, update the new copy, then move it into reader.  This isn't
-        // terribly efficient.
-        let mut access_enforcer = self.access_enforcer.clone();
-        access_enforcer.update_rule_cache(&mut self.terminal)?;
-        self.access_enforcer = access_enforcer;
+        // The AccessEnforcer swapping is a workaround for the borrow checker's conservatism.
+        let mut tmp = AccessEnforcer::new(
+            // Security profile values don't matter; this is just a placeholder.
+            SeSecurityProfile { full_access: true, use_ara_applet: false },
+            vec![],
+        );
+        std::mem::swap(&mut self.access_enforcer, &mut tmp);
+        tmp.update_rule_cache(&mut self.terminal)?;
+        std::mem::swap(&mut self.access_enforcer, &mut tmp);
+
         Ok(())
     }
 

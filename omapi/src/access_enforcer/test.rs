@@ -26,6 +26,7 @@ use crate::{
         Sha1DigestOrUuid,
     },
     terminal::Apdu,
+    utils::{service_specific_exception, ServiceSpecificException},
 };
 use android_hardware_secure_element::aidl::android::hardware::secure_element::{
     ISecureElement::{BnSecureElement, ISecureElement, MockISecureElement},
@@ -102,7 +103,7 @@ fn test_platform_rule() -> Result<()> {
     let client_id = ClientId::Uuids(vec![Sha1DigestOrUuid([0; 20])]);
 
     let security_profile = SeSecurityProfile { use_ara_applet: true, full_access: false };
-    let platform_rules = vec![Rule::from_tlv(build_allow_rule(&aid1, &uuid)).unwrap()];
+    let platform_rules = vec![Rule::from_ara_m_tlv((0, build_allow_rule(&aid1, &uuid))).unwrap()];
     let mut ae = AccessEnforcer::new(security_profile, platform_rules);
 
     assert_that!(ae.get_policy(&aid1, &client_id), ok(eq(&ApduAccessRule::Always)));
@@ -112,7 +113,7 @@ fn test_platform_rule() -> Result<()> {
     );
 
     // Test that resetting the enforcer cache doesn't lose platform rules.
-    ae.rule_cache.reset();
+    ae.reset();
     assert_that!(ae.get_policy(&aid1, &client_id), ok(eq(&ApduAccessRule::Always)));
     assert_that!(
         ae.get_policy(&aid2, &client_id),
@@ -168,11 +169,13 @@ fn test_update_rule_cache() -> Result<()> {
             expect_transmit(mock, &mut seq, GET_NEXT_APDU, chunk);
         });
         expect_close_channel(mock, &mut seq);
+        expect_open_channel_and_return_not_found(mock, &mut seq, ARA_D_AID);
 
         // Another update request.  We return the same tag, which doesn't provoke ruleset retrieval.
         expect_open_channel(mock, &mut seq, ARA_M_AID);
         expect_transmit(mock, &mut seq, GET_REFRESH_TAG_APDU, &first_refresh_tag);
         expect_close_channel(mock, &mut seq);
+        expect_open_channel_and_return_not_found(mock, &mut seq, ARA_D_AID);
 
         // A third update request, this time returning a different tag, provoking ruleset retrieval.
         // This time we'll return the whole ruleset in one response.
@@ -180,6 +183,7 @@ fn test_update_rule_cache() -> Result<()> {
         expect_transmit(mock, &mut seq, GET_REFRESH_TAG_APDU, &second_refresh_tag);
         expect_transmit(mock, &mut seq, GET_ALL_APDU, &second_rule_set_data);
         expect_close_channel(mock, &mut seq);
+        expect_open_channel_and_return_not_found(mock, &mut seq, ARA_D_AID);
     });
 
     let security_profile = SeSecurityProfile { use_ara_applet: true, full_access: false };
@@ -219,7 +223,7 @@ fn test_update_rule_cache() -> Result<()> {
     assert_that!(ae.get_policy(&aid, &client_id), ok(eq(&ApduAccessRule::Always)));
 
     // Resetting the enforcer cache should lose the ARA rules.
-    ae.rule_cache.reset();
+    ae.reset();
     assert_that!(
         ae.get_policy(&aid, &client_id),
         err(predicate(binder_status(SECURITY, "APDU access disallowed by policy")))
@@ -282,6 +286,20 @@ fn expect_open_channel(mock: &mut MockISecureElement, seq: &mut Sequence, aid: &
         .in_sequence(seq)
         .with(mp::eq(aid), mp::eq(0))
         .returning(|_, _| Ok(LogicalChannelResponse { channelNumber: 1, selectResponse: vec![] }));
+}
+
+fn expect_open_channel_and_return_not_found(
+    mock: &mut MockISecureElement,
+    seq: &mut Sequence,
+    aid: &[u8],
+) {
+    mock.expect_openLogicalChannel()
+        .times(1)
+        .in_sequence(seq)
+        .with(mp::eq(aid.to_vec()), mp::eq(0))
+        .returning(|_, _| {
+            service_specific_exception(ServiceSpecificException::NoSuchElement, "No such AID")
+        });
 }
 
 fn mock_se(expectations: impl FnOnce(&mut MockISecureElement)) -> Strong<dyn ISecureElement> {
