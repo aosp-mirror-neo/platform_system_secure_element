@@ -49,6 +49,7 @@ use thiserror::Error;
 
 use super::rules::{SHA1_OR_UUID_LEN, SHA256_LEN};
 
+#[allow(dead_code)]
 #[derive(Error, Debug)]
 pub enum AraXmlError {
     #[error("Error parsing XML: {0}")]
