@@ -21,13 +21,9 @@ use crate::{
     uuid_mapping::{parse_uuid_mappings, UuidMapping},
 };
 use android_hardware_secure_element::aidl::android::hardware::secure_element::ISecureElement::ISecureElement;
-use binder::{
-    binder_impl::IBinderInternal,
-    ExceptionCode::{ILLEGAL_ARGUMENT, ILLEGAL_STATE},
-    Result, Strong,
-};
+use binder::{binder_impl::IBinderInternal, ExceptionCode::ILLEGAL_ARGUMENT, Result, Strong};
 use itertools::Itertools;
-use log::{debug, error, info, trace};
+use log::{debug, error, info, trace, warn};
 use packagemanager_aidl::aidl::android::content::pm::{
     IPackageManagerNative::IPackageManagerNative, PackageInfoNative::PackageInfoNative,
 };
@@ -91,7 +87,9 @@ impl AndroidSystemServicesData {
             // We use [`binder::check_interface`] because the PackageManager is not available
             // during early boot and blocking here would block all early usage of OMAPI.
             let pm: Strong<dyn IPackageManagerNative> =
-                binder::check_interface(PACKAGE_MANAGER_NATIVE_SERVICE)?;
+                binder::check_interface(PACKAGE_MANAGER_NATIVE_SERVICE).inspect_err(|e| {
+                    warn!("Couldn't get PackageManager because {e}. This is normal during boot.")
+                })?;
             *pm_opt = Some(pm);
         }
         Ok(pm_opt.as_ref().unwrap().clone())
@@ -99,9 +97,6 @@ impl AndroidSystemServicesData {
 
     fn get_caller_package_info(&self, caller_uid: i32) -> Vec<PackageInfo> {
         self.get_package_manager()
-            .inspect_err(|e| {
-                info!("Unable to get package manager because {e}. This is normal in early boot.")
-            })
             .map(|package_manager| -> Vec<PackageInfo> {
                 trace!("Getting package info for {caller_uid}");
                 package_manager
@@ -130,7 +125,10 @@ impl AndroidSystemServicesData {
     }
 
     fn is_uid_privileged(&self, caller_uid: i32) -> Result<bool> {
-        let package_manager = self.get_package_manager()?;
+        let Ok(package_manager) = self.get_package_manager() else {
+            // Assume unprivileged if PackageManager is unavailable.
+            return Ok(false);
+        };
 
         let package_names: Vec<String> = package_manager.getNamesForUids(&[caller_uid])?;
 
@@ -246,23 +244,16 @@ impl SystemServices for AndroidSystemServices {
 
             info!("Parsing platform rules file: {path}");
 
-            let xml_rules = parse_xml_rules(file)
-                .map_err(|e| {
-                    create_exception_status(
-                        ILLEGAL_STATE,
-                        &format!("Error parsing XML access rules {path}: {e}"),
-                    )
-                })?
-                .ref_ar_do;
-
-            for xml_rule in xml_rules {
-                let ara_rule = Rule::from_xml(xml_rule).map_err(|e| {
-                    create_exception_status(
-                        ILLEGAL_STATE,
-                        &format!("Error converting XML access rules {path}: {e}"),
-                    )
-                })?;
-                result.push(ara_rule);
+            match parse_xml_rules(file) {
+                Ok(rule_set) => {
+                    for xml_rule in rule_set.ref_ar_do {
+                        match Rule::from_xml(xml_rule) {
+                            Ok(ara_rule) => result.push(ara_rule),
+                            Err(e) => error!("Error converting XML access rule in {path}: {e}"),
+                        }
+                    }
+                }
+                Err(e) => error!("Error parsing XML access rules in {path}: {e}"),
             }
         }
         Ok(result)
@@ -295,13 +286,10 @@ fn read_uuid_mappings() -> Result<Vec<UuidMapping>> {
     for entry in config_files(&config_file_name) {
         let Some((path, file)) = entry? else { continue };
         info!("Parsing UUID mapping file: {path}");
-        let mappings = parse_uuid_mappings(file).map_err(|e| {
-            create_exception_status(
-                ILLEGAL_STATE,
-                &format!("Error parsing UUID mapping file {path}: {e}"),
-            )
-        })?;
-        result.extend(mappings);
+        match parse_uuid_mappings(file) {
+            Ok(mappings) => result.extend(mappings),
+            Err(e) => error!("Error parsing UUID mapping file {path}: {e}"),
+        }
     }
     Ok(result)
 }
@@ -315,10 +303,10 @@ fn config_files(file_name: &str) -> impl Iterator<Item = Result<Option<(String, 
                 info!("No config file found at {path}");
                 Ok(None)
             }
-            Err(e) => Err(create_exception_status(
-                ILLEGAL_STATE,
-                &format!("Error attempting to open config file {path}: {e}"),
-            )),
+            Err(e) => {
+                error!("Error attempting to open config file {path}: {e}");
+                Ok(None)
+            }
         }
     })
 }
