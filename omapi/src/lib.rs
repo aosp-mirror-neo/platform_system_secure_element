@@ -31,6 +31,7 @@ mod uuid_mapping;
 
 pub use android_system_services::{is_debuggable_build, AndroidSystemServices};
 pub use se_service::SecureElementService;
+pub use utils::initialize_logging;
 
 #[cfg(test)]
 mod test;
