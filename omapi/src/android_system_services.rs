@@ -27,6 +27,7 @@ use log::{debug, error, info, trace, warn};
 use packagemanager_aidl::aidl::android::content::pm::{
     IPackageManagerNative::IPackageManagerNative, PackageInfoNative::PackageInfoNative,
 };
+use rustutils::android::system_properties;
 use std::{fs::File, sync::Mutex};
 
 #[cfg(test)]
@@ -184,10 +185,10 @@ impl SystemServices for AndroidSystemServices {
         if is_debuggable_build() {
             // For eng and userdebug builds we potentially skip/avoid ARA, depending on some
             // system properties.
-            let non_persist_profile = rustutils::system_properties::read(PROP_SE_SECURITY_PROFILE)
+            let non_persist_profile = system_properties::read(PROP_SE_SECURITY_PROFILE)
                 .unwrap_or(None)
                 .unwrap_or("useara usearf".to_owned());
-            let profile = rustutils::system_properties::read(PROP_SE_PERSIST_SECURITY_PROFILE)
+            let profile = system_properties::read(PROP_SE_PERSIST_SECURITY_PROFILE)
                 .unwrap_or(None)
                 .unwrap_or(non_persist_profile);
 
@@ -266,7 +267,7 @@ impl SystemServices for AndroidSystemServices {
 
 /// Returns true if the current build is debuggable.
 pub fn is_debuggable_build() -> bool {
-    rustutils::system_properties::read_bool(DEBUG_BUILD_PROPERTY, false).unwrap_or(false)
+    system_properties::read_bool(DEBUG_BUILD_PROPERTY, false).unwrap_or(false)
 }
 
 fn convert_native_package_info(info: PackageInfoNative) -> PackageInfo {
@@ -276,7 +277,7 @@ fn convert_native_package_info(info: PackageInfoNative) -> PackageInfo {
 }
 
 fn read_uuid_mappings() -> Result<Vec<UuidMapping>> {
-    let product_sku = rustutils::system_properties::read(PROP_PRODUCT_HARDWARE_SKU)
+    let product_sku = system_properties::read(PROP_PRODUCT_HARDWARE_SKU)
         .unwrap_or(None)
         .unwrap_or("config".to_owned());
     let config_file_name =
