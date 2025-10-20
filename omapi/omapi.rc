@@ -1,0 +1,3 @@
+service omapi /system/bin/omapi
+    class early_hal
+    user nobody
