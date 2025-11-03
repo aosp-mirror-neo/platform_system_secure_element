@@ -1047,7 +1047,7 @@ impl ApduFilterSet {
     /// not a multiple of 8 bytes in length.
     fn from_data(data: &[u8]) -> Result<Self> {
         ensure!(
-            !data.is_empty() && data.len() % APDU_FILTER_SET_LEN == 0,
+            !data.is_empty() && data.len().is_multiple_of(APDU_FILTER_SET_LEN),
             "Invalid data in ApduFilterSet {data:?}"
         );
         let mut filters: Vec<ApduFilter> =
