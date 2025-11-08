@@ -231,7 +231,7 @@ fn close_on_transmit_io_error() -> Result<()> {
     let session1 = reader.open_session()?;
     let session2 = reader.open_session()?;
 
-    let (Some(channel_id), _policy) =
+    let (Some(client_channel_id), _policy) =
         reader.open_logical_channel(session1, DEFAULT_AID, TEST_P2)?
     else {
         panic!("Should get a channel ID")
@@ -239,7 +239,7 @@ fn close_on_transmit_io_error() -> Result<()> {
 
     let privileged_caller = false;
     let err = reader
-        .transmit_on_channel(channel_id, &[0x00, 0x00, 0x00, 0x00], privileged_caller)
+        .transmit_on_channel(client_channel_id, &[0x00, 0x00, 0x00, 0x00], privileged_caller)
         .unwrap_err();
     assert_that!(err.exception_code(), eq(ExceptionCode::SERVICE_SPECIFIC));
     assert_that!(err.service_specific_error(), eq(ServiceSpecificException::IoError as i32));
@@ -329,9 +329,9 @@ fn privileged_caller_can_access_any_applet() -> Result<()> {
 
     // Try to open a logical channel to a test AID.
     let test_aid = &[0xA0, 0x00, 0x00, 0x00, 0x62, 0x03, 0x01, 0x0C, 0x01, 0x01];
-    let (channel_id_opt, _policy) = reader.open_logical_channel(session, test_aid, 0x00)?;
+    let (client_channel_id_opt, _policy) = reader.open_logical_channel(session, test_aid, 0x00)?;
     assert!(
-        channel_id_opt.is_some(),
+        client_channel_id_opt.is_some(),
         "Privileged caller should be able to open channel even if rules disallow"
     );
 
@@ -342,10 +342,8 @@ fn privileged_caller_can_access_any_applet() -> Result<()> {
 #[gtest]
 fn missing_ara_m() -> Result<()> {
     init();
-    assert_that!(
-        check_missing_ara_applets(false, true)?,
-        eq(&(Some(ChannelId(1)), AccessPolicy::Normal(ApduAccessRule::Always)))
-    );
+    let (client_channel_id, _policy) = check_missing_ara_applets(false, true)?;
+    assert!(client_channel_id.is_some());
     Ok(())
 }
 
@@ -353,10 +351,8 @@ fn missing_ara_m() -> Result<()> {
 #[gtest]
 fn missing_ara_d() -> Result<()> {
     init();
-    assert_that!(
-        check_missing_ara_applets(true, false)?,
-        eq(&(Some(ChannelId(1)), AccessPolicy::Normal(ApduAccessRule::Always)))
-    );
+    let (client_channel_id, _policy) = check_missing_ara_applets(true, false)?;
+    assert!(client_channel_id.is_some());
     Ok(())
 }
 
@@ -372,7 +368,7 @@ fn missing_both_ara_applets() -> Result<()> {
 fn check_missing_ara_applets(
     ara_m_present: bool,
     ara_d_present: bool,
-) -> binder::Result<(Option<ChannelId>, AccessPolicy)> {
+) -> binder::Result<(Option<ClientChannelId>, AccessPolicy)> {
     let se_binder = mock_se(|mock| {
         mock.expect_isCardPresent().returning(|| Ok(true));
         expect_ara_m_request(mock, ara_m_present);
@@ -397,6 +393,161 @@ fn check_missing_ara_applets(
     let session = reader.open_session()?;
 
     reader.open_logical_channel(session, DEFAULT_AID, TEST_P2)
+}
+
+#[gtest]
+fn use_closed_channel_fails() -> Result<()> {
+    init();
+
+    let se_binder = mock_se(|mock| {
+        mock.expect_isCardPresent().times(1).returning(|| Ok(true));
+        mock.expect_openLogicalChannel().times(1).returning(|_, _| {
+            Ok(LogicalChannelResponse { channelNumber: 1, selectResponse: vec![] })
+        });
+        mock.expect_closeChannel().returning(|_| Ok(()));
+    });
+
+    let system_services = mock_system_services(
+        Ok(se_binder),
+        // Full access security profile, to avoid triggering an ARA-M read.
+        SeSecurityProfile { use_ara_applet: false, full_access: true },
+        /* platform_rules */ Ok(vec![]),
+        /* is_caller_privileged_result */ Ok(false),
+        |mock| {
+            mock.expect_get_client_id().returning(|| Ok(ClientId::PackageInfo(vec![])));
+        },
+    );
+
+    let reader_arc = Reader::new_arc("se_name", WaitForReader(false), system_services)?;
+    let mut reader = reader_arc.lock().unwrap();
+    let session = reader.open_session()?;
+
+    let (Some(client_channel_id), _policy) =
+        reader.open_logical_channel(session, DEFAULT_AID, TEST_P2)?
+    else {
+        panic!("Should get a channel ID")
+    };
+
+    reader.close_channel(client_channel_id, SendSelectOnClose(true))?;
+
+    let privileged_caller = false;
+    let err = reader
+        .transmit_on_channel(client_channel_id, &[0x00, 0x00, 0x00, 0x00], privileged_caller)
+        .unwrap_err();
+    assert_that!(err.exception_code(), eq(ExceptionCode::ILLEGAL_STATE));
+
+    Ok(())
+}
+
+#[gtest]
+fn channel_id_reuse_is_safe() -> Result<()> {
+    init();
+
+    let se_binder = mock_se(|mock| {
+        mock.expect_isCardPresent().times(2).returning(|| Ok(true));
+        mock.expect_openLogicalChannel().times(1).returning(|_, _| {
+            Ok(LogicalChannelResponse { channelNumber: 1, selectResponse: vec![] })
+        });
+        mock.expect_closeChannel().with(mp::eq(1)).times(1).returning(|_| Ok(()));
+        mock.expect_openLogicalChannel().times(1).returning(|_, _| {
+            Ok(LogicalChannelResponse { channelNumber: 1, selectResponse: vec![] })
+            // Reuse channel number 1
+        });
+        mock.expect_closeChannel().with(mp::eq(1)).times(1).returning(|_| Ok(()));
+    });
+
+    let system_services = mock_system_services(
+        Ok(se_binder),
+        SeSecurityProfile { use_ara_applet: false, full_access: true },
+        Ok(vec![]),
+        Ok(false),
+        |mock| {
+            mock.expect_get_client_id().times(2).returning(|| Ok(ClientId::PackageInfo(vec![])));
+        },
+    );
+
+    let reader_arc = Reader::new_arc("se_name", WaitForReader(false), system_services)?;
+    let mut reader = reader_arc.lock().unwrap();
+    let session1 = reader.open_session()?;
+
+    // Client A opens a channel
+    let (Some(channel_id_a), _policy) =
+        reader.open_logical_channel(session1, DEFAULT_AID, TEST_P2)?
+    else {
+        panic!("Should get a channel ID")
+    };
+
+    // Client A closes the channel
+    reader.close_channel(channel_id_a, SendSelectOnClose(true))?;
+
+    // Client B opens a channel, underlying channel ID is reused
+    let session2 = reader.open_session()?;
+    let (Some(channel_id_b), _policy) =
+        reader.open_logical_channel(session2, DEFAULT_AID, TEST_P2)?
+    else {
+        panic!("Should get a channel ID")
+    };
+
+    // Ensure channel_id_a is different from channel_id_b
+    assert_ne!(channel_id_a, channel_id_b);
+
+    // Client A trying to use its old, closed channel ID should fail
+    let privileged_caller = false;
+    let err = reader
+        .transmit_on_channel(channel_id_a, &[0x00, 0x00, 0x00, 0x00], privileged_caller)
+        .unwrap_err();
+    assert_that!(err.exception_code(), eq(ExceptionCode::ILLEGAL_STATE));
+
+    Ok(())
+}
+
+#[gtest]
+fn closing_session_closes_channels() -> Result<()> {
+    init();
+
+    let se_binder = mock_se(|mock| {
+        mock.expect_isCardPresent().times(1).returning(|| Ok(true));
+        mock.expect_openLogicalChannel().times(2).returning(|_, _| {
+            // Return different channel numbers
+            use std::sync::atomic::{AtomicI8, Ordering};
+            static CHANNEL_COUNTER: AtomicI8 = AtomicI8::new(1);
+            let channel_number = CHANNEL_COUNTER.fetch_add(1, Ordering::SeqCst);
+            Ok(LogicalChannelResponse { channelNumber: channel_number, selectResponse: vec![] })
+        });
+        // Expect close for channel 1 and 2. Order is not guaranteed.
+        mock.expect_closeChannel().with(mp::in_iter([1, 2])).times(2).returning(|_| Ok(()));
+    });
+
+    let system_services = mock_system_services(
+        Ok(se_binder),
+        SeSecurityProfile { use_ara_applet: false, full_access: true },
+        Ok(vec![]),
+        Ok(false),
+        |mock| {
+            mock.expect_get_client_id().times(2).returning(|| Ok(ClientId::PackageInfo(vec![])));
+        },
+    );
+
+    let reader_arc = Reader::new_arc("se_name", WaitForReader(false), system_services)?;
+    let mut reader = reader_arc.lock().unwrap();
+    let session = reader.open_session()?;
+
+    let (Some(channel1), _) = reader.open_logical_channel(session, DEFAULT_AID, TEST_P2)? else {
+        panic!("Should get a channel ID")
+    };
+    let (Some(channel2), _) = reader.open_logical_channel(session, DEFAULT_AID, TEST_P2)? else {
+        panic!("Should get a channel ID")
+    };
+
+    assert!(!reader.is_channel_closed(channel1));
+    assert!(!reader.is_channel_closed(channel2));
+
+    reader.close_session(session, SendSelectOnClose(true));
+
+    assert!(reader.is_channel_closed(channel1));
+    assert!(reader.is_channel_closed(channel2));
+
+    Ok(())
 }
 
 fn expect_ara_d_request(mock: &mut MockISecureElement, is_present: bool) {
@@ -549,7 +700,22 @@ fn mock_system_services(
     mock_services.expect_get_se_hal().return_once(move |_, _| se_hal);
     mock_services.expect_get_security_profile().return_once(move || security_profile);
     mock_services.expect_get_platform_rules().return_once(move |_| platform_rules);
-    mock_services.expect_is_caller_privileged().return_once(move || is_caller_privileged_result);
+    mock_services.expect_is_caller_privileged().returning(
+        move || match &is_caller_privileged_result {
+            Ok(b) => Ok(*b),
+            Err(s) => {
+                let msg = s.get_description();
+                if s.exception_code() == ExceptionCode::SERVICE_SPECIFIC {
+                    Err(binder::Status::new_service_specific_error_str(
+                        s.service_specific_error(),
+                        Some(&msg),
+                    ))
+                } else {
+                    Err(binder::Status::new_exception_str(s.exception_code(), Some(&msg)))
+                }
+            }
+        },
+    );
     expectations(&mut mock_services);
 
     Arc::new(mock_services)

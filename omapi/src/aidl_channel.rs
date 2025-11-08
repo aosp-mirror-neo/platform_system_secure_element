@@ -17,8 +17,8 @@
 
 use crate::{
     ara::ApduHeader,
-    reader::{AccessPolicy, Reader},
-    terminal::{ChannelId, SendSelectOnClose},
+    reader::{AccessPolicy, ClientChannelId, Reader},
+    terminal::SendSelectOnClose,
     utils::{binder_exception, create_exception_status, TraceResultExt},
 };
 use android_se_omapi::aidl::android::se::omapi::{
@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 pub struct AidlChannel {
     reader: Arc<Mutex<Reader>>,
-    id: ChannelId,
+    id: ClientChannelId,
     policy: AccessPolicy,
     _death_recipient: DeathRecipient,
 }
@@ -43,7 +43,7 @@ pub struct AidlChannel {
 impl AidlChannel {
     pub fn new_native_binder(
         reader: Arc<Mutex<Reader>>,
-        id: ChannelId,
+        id: ClientChannelId,
         policy: AccessPolicy,
         listener: &Strong<dyn ISecureElementListener>,
     ) -> Strong<dyn ISecureElementChannel> {
@@ -65,7 +65,10 @@ impl AidlChannel {
     }
 }
 
-fn build_death_recipient(weak_reader_ref: Weak<Mutex<Reader>>, id: ChannelId) -> DeathRecipient {
+fn build_death_recipient(
+    weak_reader_ref: Weak<Mutex<Reader>>,
+    id: ClientChannelId,
+) -> DeathRecipient {
     DeathRecipient::new(move || {
         if let Some(reader) = weak_reader_ref.upgrade() {
             let _ = reader.lock().unwrap().close_channel(id, SendSelectOnClose(true));
@@ -108,7 +111,7 @@ impl ISecureElementChannel for AidlChannel {
 
     fn isBasicChannel(&self) -> Result<bool> {
         self.trace_caller("isBasicChannel");
-        Ok(self.id.is_basic()).trace("isBasicChannel")
+        Ok(self.reader.lock().unwrap().is_basic_channel(self.id)).trace("isBasicChannel")
     }
 
     fn getSelectResponse(&self) -> Result<Option<Vec<u8>>> {

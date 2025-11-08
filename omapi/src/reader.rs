@@ -69,6 +69,10 @@ impl AccessPolicy {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SessionId(pub u64);
 
+/// A non-repeating ID to track a single client's use of a channel.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ClientChannelId(pub u64);
+
 enum ChannelType {
     Basic,
     Logical,
@@ -82,8 +86,10 @@ pub struct Reader {
     terminal: Terminal,
     access_enforcer: AccessEnforcer,
     system_services: Arc<dyn SystemServices>,
-    sessions: HashMap<SessionId, Vec<ChannelId>>,
+    sessions: HashMap<SessionId, Vec<ClientChannelId>>,
     session_id_counter: u64,
+    client_channel_id_counter: u64,
+    client_channel_id_map: HashMap<ClientChannelId, ChannelId>,
 }
 
 impl Reader {
@@ -105,6 +111,8 @@ impl Reader {
             system_services,
             sessions: HashMap::new(),
             session_id_counter: 0,
+            client_channel_id_counter: 0,
+            client_channel_id_map: HashMap::new(),
         }));
 
         // The call to [`ISecureElement::init()`] might invoke the callback synchronously (but
@@ -147,7 +155,12 @@ impl Reader {
 
         let session_id = SessionId(self.session_id_counter);
         self.sessions.insert(session_id, Vec::new());
-        self.session_id_counter += 1;
+        self.session_id_counter = self.session_id_counter.checked_add(1).ok_or_else(|| {
+            Status::new_exception_str(
+                ILLEGAL_STATE,
+                Some("Too many sessions opened; counter overflow"),
+            )
+        })?;
 
         trace!("Opened {session_id:?}");
         Ok(session_id)
@@ -158,7 +171,7 @@ impl Reader {
         session_id: SessionId,
         aid: &[u8],
         p2: i8,
-    ) -> Result<(Option<ChannelId>, AccessPolicy)> {
+    ) -> Result<(Option<ClientChannelId>, AccessPolicy)> {
         self.open_channel_internal(ChannelType::Basic, session_id, aid, p2)
             .inspect_err(|err| self.close_on_ioerror(err))
     }
@@ -168,27 +181,33 @@ impl Reader {
         session_id: SessionId,
         aid: &[u8],
         p2: i8,
-    ) -> Result<(Option<ChannelId>, AccessPolicy)> {
+    ) -> Result<(Option<ClientChannelId>, AccessPolicy)> {
         self.open_channel_internal(ChannelType::Logical, session_id, aid, p2)
             .inspect_err(|err| self.close_on_ioerror(err))
     }
 
     /// Get the response returned by the SELECT command sent when the specified channel was
     /// opened, if any.
-    pub fn select_response(&self, channel_id: ChannelId) -> Option<&[u8]> {
-        self.terminal.select_response(channel_id)
+    pub fn select_response(&self, client_channel_id: ClientChannelId) -> Option<&[u8]> {
+        self.client_channel_id_map
+            .get(&client_channel_id)
+            .and_then(|channel_id| self.terminal.select_response(*channel_id))
     }
 
     /// Transmit the specified `apdu` on the specified channel.  If `privileged_caller` is true,
     /// privileged APDUs will be allowed.
     pub fn transmit_on_channel(
         &mut self,
-        channel_id: ChannelId,
+        client_channel_id: ClientChannelId,
         apdu: &[u8],
         privileged_caller: bool,
     ) -> Result<ApduResponse> {
+        let channel_id = self.client_channel_id_map.get(&client_channel_id);
+        let Some(channel_id) = channel_id else {
+            return binder_exception(ILLEGAL_STATE, &format!("{client_channel_id:?} is closed."));
+        };
         self.terminal
-            .transmit(channel_id, apdu, privileged_caller)
+            .transmit(*channel_id, apdu, privileged_caller)
             .inspect_err(|e| self.close_on_ioerror(e))
     }
 
@@ -196,21 +215,25 @@ impl Reader {
     /// [`ChannelId::BASIC`] and `send_select` is `true`.
     pub fn close_channel(
         &mut self,
-        channel_id: ChannelId,
+        client_channel_id: ClientChannelId,
         send_select: SendSelectOnClose,
     ) -> Result<()> {
-        self.sessions
-            .iter_mut()
-            .for_each(|(_, channel_ids)| channel_ids.retain(|id| *id != channel_id));
-        self.terminal.close_channel(channel_id, send_select)
+        self.sessions.iter_mut().for_each(|(_, client_channel_ids)| {
+            client_channel_ids.retain(|id| *id != client_channel_id)
+        });
+        if let Some(channel_id) = self.client_channel_id_map.remove(&client_channel_id) {
+            self.terminal.close_channel(channel_id, send_select)
+        } else {
+            Ok(())
+        }
     }
 
     /// Close all open channels on the specified session.  If the [`ChannelId::BASIC`] channel is
     /// open and `send_select` is `true`, the default applet will be selected.
     pub fn close_session_channels(&mut self, id: SessionId, send_select: SendSelectOnClose) {
         let mut tmp = Vec::new();
-        if let Some(channel_ids) = self.sessions.get_mut(&id) {
-            std::mem::swap(channel_ids, &mut tmp);
+        if let Some(client_channel_ids) = self.sessions.get_mut(&id) {
+            std::mem::swap(client_channel_ids, &mut tmp);
             self.close_channel_ids(tmp, send_select);
         } else {
             error!("Attempted to close channels for closed {id:?}");
@@ -237,13 +260,20 @@ impl Reader {
     }
 
     /// Return true iff the specified channel is closed.
-    pub fn is_channel_closed(&mut self, channel_id: ChannelId) -> bool {
-        self.terminal.channel_closed(channel_id)
+    pub fn is_channel_closed(&mut self, client_channel_id: ClientChannelId) -> bool {
+        !self.client_channel_id_map.contains_key(&client_channel_id)
     }
 
     /// Returns true iff the specified session has been closed.
     pub fn is_session_closed(&self, session_id: SessionId) -> bool {
         !self.sessions.contains_key(&session_id)
+    }
+
+    /// Returns true iff the specified channel is the basic channel.
+    pub fn is_basic_channel(&self, client_channel_id: ClientChannelId) -> bool {
+        self.client_channel_id_map
+            .get(&client_channel_id)
+            .is_some_and(|channel_id| channel_id.is_basic())
     }
 
     /// Reset (reboot, essentially) the SE.
@@ -261,7 +291,7 @@ impl Reader {
         session_id: SessionId,
         aid: &[u8],
         p2: i8,
-    ) -> Result<(Option<ChannelId>, AccessPolicy)> {
+    ) -> Result<(Option<ClientChannelId>, AccessPolicy)> {
         let policy = self.get_access_policy(aid)?;
         let channel_id = match channel_type {
             ChannelType::Basic => self.terminal.open_basic_channel(aid, p2)?,
@@ -272,17 +302,36 @@ impl Reader {
             let Some(session) = self.sessions.get_mut(&session_id) else {
                 return binder_exception(ILLEGAL_STATE, &format!("{session_id:?} is closed."));
             };
-            session.push(channel_id);
+            let client_channel_id = ClientChannelId(self.client_channel_id_counter);
+            self.client_channel_id_map.insert(client_channel_id, channel_id);
+            session.push(client_channel_id);
+            self.client_channel_id_counter =
+                self.client_channel_id_counter.checked_add(1).ok_or_else(|| {
+                    Status::new_exception_str(
+                        ILLEGAL_STATE,
+                        Some("Too many channels opened; counter overflow"),
+                    )
+                })?;
+            Ok((Some(client_channel_id), policy))
+        } else {
+            Ok((None, policy))
         }
-
-        Ok((channel_id, policy))
     }
 
-    fn close_channel_ids(&mut self, channel_ids: Vec<ChannelId>, send_select: SendSelectOnClose) {
-        // sorted()/rev() is used so we close the basic channel last.
-        itertools::sorted(channel_ids).rev().for_each(|id| {
+    fn close_channel_ids(
+        &mut self,
+        client_channel_ids: Vec<ClientChannelId>,
+        send_select: SendSelectOnClose,
+    ) {
+        // sort() and rev() are used so we close the basic channel last.
+        let mut channel_ids = client_channel_ids
+            .iter()
+            .filter_map(|client_channel_id| self.client_channel_id_map.remove(client_channel_id))
+            .collect::<Vec<ChannelId>>();
+        channel_ids.sort();
+        for id in channel_ids.into_iter().rev() {
             let _ = self.terminal.close_channel(id, send_select);
-        });
+        }
     }
 
     fn on_state_change(&mut self, connected: bool, debug_reason: &str) {
@@ -345,7 +394,7 @@ impl Reader {
     }
 
     #[cfg(test)]
-    pub fn get_open_sessions(&self) -> HashMap<SessionId, Vec<ChannelId>> {
+    pub fn get_open_sessions(&self) -> HashMap<SessionId, Vec<ClientChannelId>> {
         self.sessions.clone()
     }
 
