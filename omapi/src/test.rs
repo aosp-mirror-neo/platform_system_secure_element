@@ -14,11 +14,10 @@
 
 use crate::{
     aidl_reader::AidlReader,
-    reader::{Reader, SessionId},
+    reader::{ClientChannelId, Reader, SessionId},
     system_services::{
         ClientId, MockSystemServices, SeSecurityProfile, SystemServices, WaitForReader,
     },
-    terminal::ChannelId,
     utils::ServiceSpecificException,
 };
 use android_hardware_secure_element::aidl::android::hardware::secure_element::{
@@ -382,7 +381,10 @@ fn io_error() -> Result<()> {
 
     assert_eq!(
         reader_arc.lock().unwrap().get_open_sessions(),
-        HashMap::from([(SessionId(0), vec![ChannelId(0)]), (SessionId(1), vec![ChannelId(1)])])
+        HashMap::from([
+            (SessionId(0), vec![ClientChannelId(0)]),
+            (SessionId(1), vec![ClientChannelId(1)])
+        ])
     );
 
     // Second open should fail.
