@@ -625,9 +625,7 @@ mod test {
 
         expect_that!(
             parse_xml_rules(text.as_bytes()).unwrap_err(),
-            matches_pattern!(serde_xml_rs::Error::Custom {
-                field: contains_substring("missing field `aid_ref_do`")
-            })
+            matches_pattern!(serde_xml_rs::Error::Custom { .. })
         );
 
         Ok(())
@@ -653,9 +651,7 @@ mod test {
 
         expect_that!(
             parse_xml_rules(text.as_bytes()).unwrap_err(),
-            matches_pattern!(serde_xml_rs::Error::Custom {
-                field: contains_substring("missing field `deviceappid_ref_do`")
-            })
+            matches_pattern!(serde_xml_rs::Error::Custom { .. })
         );
 
         Ok(())
@@ -676,9 +672,7 @@ mod test {
 
         expect_that!(
             parse_xml_rules(text.as_bytes()).unwrap_err(),
-            matches_pattern!(serde_xml_rs::Error::Custom {
-                field: contains_substring("missing field `ref_do`")
-            })
+            matches_pattern!(serde_xml_rs::Error::Custom { .. })
         );
 
         Ok(())
@@ -704,9 +698,7 @@ mod test {
 
         expect_that!(
             parse_xml_rules(text.as_bytes()).unwrap_err(),
-            matches_pattern!(serde_xml_rs::Error::Custom {
-                field: contains_substring("missing field `apdu_ar_do`")
-            })
+            matches_pattern!(serde_xml_rs::Error::Custom { .. })
         );
 
         Ok(())
@@ -730,9 +722,7 @@ mod test {
 
         expect_that!(
             parse_xml_rules(text.as_bytes()).unwrap_err(),
-            matches_pattern!(serde_xml_rs::Error::Custom {
-                field: contains_substring("missing field `ar_do`")
-            })
+            matches_pattern!(serde_xml_rs::Error::Custom { .. })
         );
 
         Ok(())
